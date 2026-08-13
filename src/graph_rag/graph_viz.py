@@ -18,28 +18,54 @@ _TYPE_COLORS = {
     "other": "#9AA5B1",
 }
 
+# vis.js (внутри pyvis) с "dynamic" edge-smoothing на графе в ~1000+ узлов вешал
+# вкладку браузера намертво (проверено вживую). Причина оказалась именно в smooth-режиме
+# рёбер, а не в количестве узлов самом по себе — без него граф на 1119 узлов/575 рёбер со
+# статичной раскладкой (см. ниже) рендерится нормально. MAX_RENDER_NODES всё равно
+# оставлен как защита на уровне функции (не только UI) на случай корпуса заметно больше
+# текущего — 100 документов дают не более пары тысяч сущностей, но LLM-извлечение на
+# зашумлённых данных иногда плодит дубли/мусорные "сущности" (см. README про entity
+# resolution), так что явный потолок дешевле, чем полагаться на размер корпуса.
+MAX_RENDER_NODES = 5000
+
 
 def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: str = "600px") -> str:
     """HTML интерактивного графа. Если `keys` задан — только подграф на этих узлах
-    (и рёбра между ними), иначе — весь граф. Размер узла ~ степень в подграфе (видно,
-    какие сущности — хабы), цвет — тип сущности."""
+    (и рёбра между ними), иначе — весь граф (с обрезкой до `MAX_RENDER_NODES` самых
+    связанных узлов, если исходный граф больше — см. `MAX_RENDER_NODES`). Размер узла ~
+    степень в подграфе (видно, какие сущности — хабы), цвет — тип сущности.
+
+    Позиции узлов считаются один раз через `spring_layout` с фиксированным seed и
+    отдаются в pyvis с `physics=False` — раскладка детерминирована и не пересчитывается
+    силовой симуляцией при каждой перерисовке (иначе на графе в сотни узлов каждый
+    ререндер в Streamlit — это заново "трясущаяся" анимация в течение нескольких секунд).
+    Узлы всё равно перетаскиваемы мышью — физика влияет только на авто-раскладку.
+    Сглаживание рёбер отключено (`smooth: false`) — с "dynamic"/"continuous" на графе
+    от нескольких сотен рёбер именно рендер (не layout) вешает вкладку."""
     nodes = keys if keys is not None else set(G.nodes)
+    if len(nodes) > MAX_RENDER_NODES:
+        degree_full = dict(G.subgraph(nodes).degree())
+        nodes = {k for k, _ in sorted(degree_full.items(), key=lambda item: -item[1])[:MAX_RENDER_NODES]}
+
     subgraph = G.subgraph(nodes)
     degree = dict(subgraph.degree())
+    pos = nx.spring_layout(subgraph, seed=42) if nodes else {}
 
     net = Network(height=height, width="100%", directed=True, notebook=False, cdn_resources="in_line")
-    net.barnes_hut(gravity=-4000, spring_length=140)
-    net.set_edge_smooth("dynamic")  # разводит параллельные рёбра между одной парой узлов
+    net.set_options('{"edges": {"smooth": false}, "physics": {"enabled": false}}')
 
     for key in nodes:
         data = G.nodes[key]
         size = min(10 + 3 * degree.get(key, 0), 60)
+        x, y = pos[key]
         net.add_node(
             key,
             label=data["name"],
             title=f"{data['name']} ({data['type']}) — упомянут в {len(data['doc_ids'])} док.",
             color=_TYPE_COLORS.get(data["type"], _TYPE_COLORS["other"]),
             size=size,
+            x=float(x) * 800,
+            y=float(y) * 800,
         )
 
     for u, v, data in G.edges(data=True):
@@ -47,9 +73,20 @@ def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: s
             net.add_edge(
                 u,
                 v,
-                label=data["predicate"],
                 title=f"{data['predicate']} ({len(data['doc_ids'])} док.: {', '.join(sorted(data['doc_ids'])[:5])})",
                 arrows="to",
             )
 
-    return net.generate_html(notebook=False)
+    html = net.generate_html(notebook=False)
+    # С physics:false vis.js на графах в сотни узлов иногда не делает первый реальный
+    # отрисовочный кадр сам (canvas остаётся пустым, хотя network.getPositions() и
+    # network.getScale() возвращают нормальные значения — данные загружены, просто не
+    # нарисованы) — проверено вживую. network.once("stabilizationIterationsDone", ...),
+    # на который обычно полагается vis.js для первого fit+redraw, не срабатывает вовсе,
+    # если физика выключена. Форсируем redraw()+fit() явно, а не полагаемся на авто-отрисовку.
+    html = html.replace(
+        "</body>",
+        "<script>setTimeout(function(){ if (typeof network !== 'undefined') "
+        "{ network.redraw(); network.fit(); } }, 50);</script></body>",
+    )
+    return html

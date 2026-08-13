@@ -18,8 +18,19 @@ if not (EMBEDDINGS_PATH.exists() and GRAPH_PATH.exists()):
     st.stop()
 
 from graph_rag.graph_store import load_graph, neighborhood_keys  # noqa: E402
-from graph_rag.graph_viz import build_pyvis_html  # noqa: E402
+from graph_rag.graph_viz import MAX_RENDER_NODES, build_pyvis_html  # noqa: E402
 from graph_rag.rag import answer  # noqa: E402 — импорт после проверки артефактов
+
+@st.cache_resource(show_spinner=False)
+def _cached_graph():
+    return load_graph()
+
+
+@st.cache_data(show_spinner="Строю визуализацию графа...")
+def _cached_graph_html(keys_tuple: tuple[str, ...] | None, height: str) -> str:
+    keys = set(keys_tuple) if keys_tuple is not None else None
+    return build_pyvis_html(_cached_graph(), keys=keys, height=height)
+
 
 with st.sidebar:
     st.subheader("Корпус")
@@ -28,6 +39,11 @@ with st.sidebar:
         st.caption(f"{clusters['k']} тематических кластеров")
         for cid, c in clusters["clusters"].items():
             st.write(f"**{c['label']}** — {c['size']} док.")
+
+# st.chat_input вызывается на верхнем уровне (не внутри вкладки) — иначе Streamlit не
+# прижимает поле ввода ко дну страницы, и оно визуально "уезжает" выше уже отрисованной
+# истории чата.
+question = st.chat_input("Задай вопрос по корпусу BBC News...")
 
 chat_tab, graph_tab = st.tabs(["💬 Чат", "🕸️ Граф"])
 
@@ -42,7 +58,7 @@ with chat_tab:
                 with st.expander("Источники"):
                     st.json(message["sources"])
 
-    if question := st.chat_input("Задай вопрос по корпусу BBC News..."):
+    if question:
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
@@ -67,8 +83,14 @@ with chat_tab:
             {"role": "assistant", "content": result["answer"], "sources": sources}
         )
 
-with graph_tab:
-    G = load_graph()
+@st.fragment
+def _render_graph_tab() -> None:
+    # @st.fragment — виджеты этой вкладки (radio/slider/text_input) перезапускают
+    # только эту функцию, а не весь скрипт целиком. Без этого любое взаимодействие
+    # с вкладкой "Граф" во время ответа в чате обрывало генерацию ответа: Streamlit
+    # при новом прогоне скрипта отменяет предыдущий, ещё выполняющийся — а чат и граф
+    # были частью одного и того же линейного скрипта.
+    G = _cached_graph()
     st.caption(f"Всего в графе: {G.number_of_nodes()} сущностей, {G.number_of_edges()} связей")
 
     mode = st.radio(
@@ -91,7 +113,19 @@ with graph_tab:
             if keys is None:
                 st.warning("Не нашёл такую сущность в графе.")
     # mode == "Весь граф" — keys остаётся None, build_pyvis_html рисует весь G
+    # (с обрезкой до MAX_RENDER_NODES самых связанных — см. graph_viz.py)
+
+    if mode == "Весь граф" and G.number_of_nodes() > MAX_RENDER_NODES:
+        st.caption(
+            f"В графе {G.number_of_nodes()} узлов — рендер такого количества виснет в "
+            f"браузере (vis.js), показаны {MAX_RENDER_NODES} самых связанных."
+        )
 
     if mode != "Окрестность сущности" or keys:
-        html = build_pyvis_html(G, keys=keys, height="650px")
+        keys_tuple = tuple(sorted(keys)) if keys is not None else None
+        html = _cached_graph_html(keys_tuple, "650px")
         components.html(html, height=670, scrolling=True)
+
+
+with graph_tab:
+    _render_graph_tab()

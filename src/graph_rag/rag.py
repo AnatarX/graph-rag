@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -33,7 +34,8 @@ _SYSTEM_PROMPT = """\
 не выдумывай. Не копируй фрагменты контекста дословно — перескажи своими словами.
 
 Отвечай на том же языке, на котором задан вопрос (если вопрос по-русски — отвечай
-по-русски, даже если исходные документы на английском).
+по-русски, даже если исходные документы на английском). Весь ответ целиком должен быть
+на этом одном языке — ни слова на каком-либо другом языке, включая китайский.
 
 После утверждений, взятых из источника, указывай его реальный идентификатор в квадратных
 скобках, подставляя вместо doc_id настоящее значение из контекста — например, если в
@@ -129,6 +131,18 @@ def _build_context_block(retrieval: RetrievalResult) -> str:
     return "\n\n".join(parts)
 
 
+_CJK_RE = re.compile(r"[一-鿿]")
+
+
+def _leaked_cjk(text: str, query: str) -> bool:
+    """На маленьких локальных моделях (Qwen) изредка "утекает" в китайский —
+    известная особенность именно этого семейства моделей, воспроизводится даже на
+    temperature=0 детерминированно для конкретных промптов, инструкция в системном
+    промпте это не всегда перебивает. Проверяем только когда сам вопрос не на
+    китайском — иначе это не утечка, а нормальный ответ на языке вопроса."""
+    return bool(_CJK_RE.search(text)) and not _CJK_RE.search(query)
+
+
 def answer(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> dict:
     retrieval = retrieve(query, top_k_docs=top_k_docs, hops=hops)
     context = _build_context_block(retrieval)
@@ -138,6 +152,14 @@ def answer(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> 
         {"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
     ]
     response_text = chat_complete(messages, max_tokens=800, use_cache=False)
+    if _leaked_cjk(response_text, query):
+        # temperature=0 (жадное декодирование) детерминированно застревает в
+        # китайской "колее" для некоторых промптов — небольшая температура иногда
+        # даёт модели свернуть на нужный язык. Не гарантия, но одна повторная
+        # попытка почти бесплатна по сравнению с уже потраченным временем на первую.
+        retry_text = chat_complete(messages, max_tokens=800, use_cache=False, temperature=0.3)
+        if not _leaked_cjk(retry_text, query):
+            response_text = retry_text
 
     return {
         "answer": response_text,
