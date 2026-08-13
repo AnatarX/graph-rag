@@ -122,9 +122,13 @@ def _render_graph_tab() -> None:
         )
 
     if mode != "Окрестность сущности" or keys:
+        # "Весь граф" — заметно больше узлов на экране, чем в остальных режимах, поэтому
+        # даём ему больше пикселей: иначе даже с клэмпом минимального зума (graph_viz.py)
+        # реально видимая область получается тесной.
+        px_height = "1100px" if mode == "Весь граф" else "650px"
         keys_tuple = tuple(sorted(keys)) if keys is not None else None
-        html = _cached_graph_html(keys_tuple, "650px")
-        components.html(html, height=670, scrolling=True)
+        html = _cached_graph_html(keys_tuple, px_height)
+        components.html(html, height=int(px_height.rstrip("px")) + 20, scrolling=True)
 
 
 with graph_tab:

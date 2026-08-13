@@ -28,6 +28,9 @@ _TYPE_COLORS = {
 # resolution), так что явный потолок дешевле, чем полагаться на размер корпуса.
 MAX_RENDER_NODES = 5000
 
+# Минимальный масштаб после auto-fit — ниже этого узлы/подписи превращаются в кашу.
+_MIN_SCALE = 0.45
+
 
 def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: str = "600px") -> str:
     """HTML интерактивного графа. Если `keys` задан — только подграф на этих узлах
@@ -52,7 +55,15 @@ def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: s
     pos = nx.spring_layout(subgraph, seed=42) if nodes else {}
 
     net = Network(height=height, width="100%", directed=True, notebook=False, cdn_resources="in_line")
-    net.set_options('{"edges": {"smooth": false}, "physics": {"enabled": false}}')
+    net.set_options(
+        '{"edges": {"smooth": false}, "physics": {"enabled": false}, '
+        # "Весь граф" (1000+ узлов) с всегда видимыми подписями — нечитаемая каша
+        # перекрывающегося текста, даже при разумном зуме. drawThreshold прячет подпись,
+        # пока сам узел на экране мельче этого числа пикселей — на overview видно только
+        # цветные точки (форму графа/кластеры), подписи проявляются по мере приближения.
+        # Подсказка (title) при наведении работает независимо от этого, всегда.
+        '"nodes": {"scaling": {"label": {"enabled": true, "drawThreshold": 9}}}}'
+    )
 
     for key in nodes:
         data = G.nodes[key]
@@ -84,9 +95,18 @@ def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: s
     # нарисованы) — проверено вживую. network.once("stabilizationIterationsDone", ...),
     # на который обычно полагается vis.js для первого fit+redraw, не срабатывает вовсе,
     # если физика выключена. Форсируем redraw()+fit() явно, а не полагаемся на авто-отрисовку.
+    #
+    # fit() зумит так, чтобы влезли ВСЕ узлы разом — на графе в 1000+ узлов это зум,
+    # при котором подписи и сами узлы становятся нечитаемо мелкими. Клэмпим минимальный
+    # масштаб после fit(): если он получился меньше _MIN_SCALE, принудительно
+    # приближаем — тогда весь граф целиком может не влезать в первый экран, зато то,
+    # что видно, читаемо; остальное — колёсиком мыши/перетаскиванием (граф интерактивный).
     html = html.replace(
         "</body>",
-        "<script>setTimeout(function(){ if (typeof network !== 'undefined') "
-        "{ network.redraw(); network.fit(); } }, 50);</script></body>",
+        "<script>setTimeout(function(){ if (typeof network !== 'undefined') { "
+        "network.redraw(); network.fit(); "
+        f"var s = network.getScale(); var MIN_SCALE = {_MIN_SCALE}; "
+        "if (s < MIN_SCALE) { network.moveTo({scale: MIN_SCALE}); } "
+        "} }, 50);</script></body>",
     )
     return html
