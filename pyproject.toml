@@ -20,6 +20,7 @@ dependencies = [
     "rapidfuzz>=3.9",
     "kagglehub>=0.3",
     "typer>=0.12",
+    "pyvis>=0.3.2",
 ]
 
 [dependency-groups]

@@ -152,14 +152,24 @@ def shortest_path(G: nx.MultiDiGraph, source: str, target: str) -> dict | None:
     return {"path": [G.nodes[n]["name"] for n in path], "steps": steps}
 
 
-def k_hop_neighbors(G: nx.MultiDiGraph, entity: str, hops: int = 1) -> dict | None:
-    """Всё, что связано с сущностью через 1-2 хопа: соседи + факты (триплеты) между
-    узлами внутри этой окрестности."""
+def neighborhood_keys(G: nx.MultiDiGraph, entity: str, hops: int = 1) -> set[str] | None:
+    """Ключи узлов в k-hop окрестности сущности (включая саму сущность), или None,
+    если сущность не найдена. Используется и для фактов (`k_hop_neighbors`), и для
+    подграфа при визуализации (`graph_viz.build_pyvis_html`)."""
     key = resolve_entity(G, entity)
     if key is None:
         return None
     undirected = G.to_undirected(as_view=True)
-    lengths = nx.single_source_shortest_path_length(undirected, key, cutoff=hops)
+    return set(nx.single_source_shortest_path_length(undirected, key, cutoff=hops))
+
+
+def k_hop_neighbors(G: nx.MultiDiGraph, entity: str, hops: int = 1) -> dict | None:
+    """Всё, что связано с сущностью через 1-2 хопа: соседи + факты (триплеты) между
+    узлами внутри этой окрестности."""
+    lengths = neighborhood_keys(G, entity, hops)
+    if lengths is None:
+        return None
+    key = resolve_entity(G, entity)
 
     facts = []
     for a, b, data in G.edges(data=True):
