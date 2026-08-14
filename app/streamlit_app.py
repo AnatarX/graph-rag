@@ -47,13 +47,17 @@ with st.sidebar:
 # st.chat_input вызывается на верхнем уровне (не внутри вкладки) — иначе Streamlit не
 # прижимает поле ввода ко дну страницы, и оно визуально "уезжает" выше уже отрисованной
 # истории чата.
-question = st.chat_input("Задай вопрос по корпусу BBC News...")
+question = st.chat_input("Задай вопрос по датасету BBC News...")
 
 chat_tab, graph_tab = st.tabs(["💬 Чат", "🕸️ Граф"])
 
+# Первые два примера содержат имена собственные из датасета — на них срабатывает
+# графовая часть retrieval (см. README про ограничение: сущности в графе английские,
+# т.к. датасет английский, поэтому чисто русский вопрос граф не активирует). Третий —
+# намеренно без имён, чтобы было видно и чисто векторный режим.
 EXAMPLE_QUESTIONS = [
-    "Расскажи про футбол и расизм",
-    "Что происходит в британской политике?",
+    "Расскажи про Tony Blair",
+    "Что связывает Tony Blair и Michael Howard?",
     "Какие проблемы с безопасностью ПК обсуждаются?",
 ]
 
@@ -78,19 +82,26 @@ def _render_sources(sources: dict) -> None:
             st.caption(f"...и ещё {len(facts) - 15}")
 
     if not (entities or docs or facts):
-        st.caption("Источники не найдены — ответ, скорее всего, вне корпуса.")
+        st.caption("Источники не найдены — ответ, скорее всего, вне датасета.")
 
 
 with chat_tab:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    if not st.session_state.messages:
-        st.markdown("👋 Спроси что-нибудь про корпус, или начни с примера:")
-        cols = st.columns(len(EXAMPLE_QUESTIONS))
-        for col, example in zip(cols, EXAMPLE_QUESTIONS):
-            if col.button(example, use_container_width=True):
-                question = example
+    # Кнопки-примеры рендерятся всегда, а не только при пустой истории: если виджет
+    # не отрисован в текущем прогоне скрипта, его клик просто теряется — то есть при
+    # "показываем только когда чат пуст" вторая по счёту кнопка не срабатывала бы
+    # никогда (после первого ответа история уже не пуста).
+    st.markdown(
+        "👋 Спроси что-нибудь про датасет, или начни с примера:"
+        if not st.session_state.messages
+        else "Примеры вопросов:"
+    )
+    cols = st.columns(len(EXAMPLE_QUESTIONS))
+    for col, example in zip(cols, EXAMPLE_QUESTIONS):
+        if col.button(example, use_container_width=True):
+            question = example
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):

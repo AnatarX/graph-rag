@@ -29,7 +29,7 @@ DOC_CLUSTERS_PATH = settings.artifacts_dir / "doc_clusters.parquet"
 @app.command()
 def build(force: bool = typer.Option(False, "--force", help="Пересчитать все шаги заново")) -> None:
     if force or not DOCS_PATH.exists():
-        typer.echo("[1/5] ingest: сэмплирую корпус...")
+        typer.echo("[1/5] ingest: сэмплирую датасет...")
         save_corpus(load_corpus())
     else:
         typer.echo("[1/5] ingest: уже есть, пропускаю")
@@ -37,7 +37,7 @@ def build(force: bool = typer.Option(False, "--force", help="Пересчита�
     typer.echo(f"      {len(docs)} документов")
 
     if force or not EMBEDDINGS_PATH.exists():
-        typer.echo("[2/5] embeddings: считаю через cloud.ru...")
+        typer.echo("[2/5] embeddings: считаю через LLM-провайдера...")
         build_embeddings(force=force)
     else:
         typer.echo("[2/5] embeddings: уже есть, пропускаю")

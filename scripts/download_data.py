@@ -2,7 +2,7 @@
 
 Датасет: yufengdev/bbc-fulltext-and-category — один CSV (bbc-text.csv) с колонками
 `category` и `text`, ~2225 новостных статей по 5 категориям (business, entertainment,
-politics, sport, tech). Берём его, а не более крупные корпуса вроде полного BBC News
+politics, sport, tech). Берём его, а не более крупные датасета вроде полного BBC News
 Summary, потому что для задания важна не полнота, а чистая структура: короткие
 однозначные категории и плотный текст с именованными сущностями.
 

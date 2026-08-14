@@ -1,4 +1,4 @@
-"""Векторизация корпуса через cloud.ru embeddings API.
+"""Векторизация датасета через embeddings API настроенного LLM-провайдера.
 
 Результат — `artifacts/embeddings.npy` (N x D, порядок строк соответствует порядку
 документов в `artifacts/docs.parquet`). Сам API-вызов уже кэшируется по хэшу текста

@@ -3,12 +3,12 @@
 Узел — сущность (ключ узла — нормализованное имя: casefold + strip, чтобы схлопывать
 "Apple" / "apple" / " Apple " в один узел; отображаемое имя — самый частый вариант
 написания). Ребро — направленная связь subject -> object с predicate и списком
-doc_id, где эта связь была упомянута (провенанс).
+doc_id, где эта связь была упомянута.
 
 Нормализация именно строковая (casefold), а не embedding-based entity resolution —
 осознанное упрощение для 100 документов: точных дублей достаточно, чтобы граф не
-разваливался на дубли узлов внутри одного корпуса новостей. На большом и шумном
-корпусе это первое, что перестанет работать (см. README, раздел про масштаб).
+разваливался на дубли узлов внутри одного датасета новостей. На большом и шумном
+датасете это первое, что перестанет работать (см. README, раздел про масштаб).
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from pathlib import Path
 
 import networkx as nx
 import pandas as pd
+import typer
 from rapidfuzz import fuzz, process
 
 from graph_rag.config import settings
@@ -209,3 +210,48 @@ def docs_linked_to_cluster(G: nx.MultiDiGraph, cluster_id: int, doc_clusters: pd
         "linked_doc_ids": sorted(linked_doc_ids),
         "extra_doc_ids_via_graph": sorted(linked_doc_ids - cluster_doc_ids),
     }
+
+
+# --- CLI: чтобы три запроса выше можно было потрогать руками, а не только из кода ----
+
+cli = typer.Typer(add_completion=False, help="Запросы по графу знаний.")
+
+
+@cli.command("path")
+def _cli_path(source: str, target: str) -> None:
+    """Через какие сущности связаны X и Y."""
+    result = shortest_path(load_graph(), source, target)
+    if result is None:
+        typer.echo("Путь не найден (или одна из сущностей отсутствует в графе).")
+        raise typer.Exit(1)
+    typer.echo(" -> ".join(result["path"]))
+    for step in result["steps"]:
+        typer.echo(f"  {step['from']} --{'/'.join(step['predicates'])}--> {step['to']}")
+
+
+@cli.command("neighbors")
+def _cli_neighbors(entity: str, hops: int = typer.Option(1, "--hops")) -> None:
+    """Всё, что связано с сущностью через 1-2 хопа."""
+    result = k_hop_neighbors(load_graph(), entity, hops=hops)
+    if result is None:
+        typer.echo(f"Сущность {entity!r} не найдена в графе.")
+        raise typer.Exit(1)
+    typer.echo(f"{result['entity']}: {len(result['neighbors'])} соседей, {len(result['facts'])} фактов")
+    for fact in result["facts"]:
+        typer.echo(f"  {fact['subject']} --{fact['predicate']}--> {fact['object']}  {fact['doc_ids']}")
+
+
+@cli.command("cluster")
+def _cli_cluster(cluster_id: int) -> None:
+    """Документы кластера N + документы, до которых граф дотягивается через общие сущности."""
+    from graph_rag.clustering import load_doc_clusters
+
+    result = docs_linked_to_cluster(load_graph(), cluster_id, load_doc_clusters())
+    typer.echo(f"документов в кластере:        {len(result['cluster_doc_ids'])}")
+    typer.echo(f"связанных через граф (всего): {len(result['linked_doc_ids'])}")
+    typer.echo(f"из них ВНЕ кластера:          {len(result['extra_doc_ids_via_graph'])}")
+    typer.echo(f"  {result['extra_doc_ids_via_graph']}")
+
+
+if __name__ == "__main__":
+    cli()
