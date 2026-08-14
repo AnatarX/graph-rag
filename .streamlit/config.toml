@@ -1,0 +1,4 @@
+# minimal — убирает панель Streamlit (кнопка Deploy, меню с "Print", "Record a screencast"
+# и т.п.) — это тестовый проект, не хостится через Streamlit Cloud, эти пункты не нужны.
+[client]
+toolbarMode = "minimal"

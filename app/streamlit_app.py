@@ -9,6 +9,10 @@ from graph_rag.graph_store import GRAPH_PATH
 
 st.set_page_config(page_title="Mini GraphRAG · BBC News", page_icon="🕸️", layout="wide")
 st.title("🕸️ Mini GraphRAG — BBC News")
+st.caption(
+    "Гибридный поиск (векторный + граф знаний) по 100 статьям BBC News — "
+    "спроси что-нибудь про политику, теннис, футбол, финансы или IT-безопасность."
+)
 
 if not (EMBEDDINGS_PATH.exists() and GRAPH_PATH.exists()):
     st.warning(
@@ -47,16 +51,53 @@ question = st.chat_input("Задай вопрос по корпусу BBC News..
 
 chat_tab, graph_tab = st.tabs(["💬 Чат", "🕸️ Граф"])
 
+EXAMPLE_QUESTIONS = [
+    "Расскажи про футбол и расизм",
+    "Что происходит в британской политике?",
+    "Какие проблемы с безопасностью ПК обсуждаются?",
+]
+
+
+def _render_sources(sources: dict) -> None:
+    entities = sources.get("matched_entities") or []
+    if entities:
+        st.caption("Сущности из вопроса, найденные в графе: " + ", ".join(entities))
+
+    docs = sources.get("documents") or []
+    if docs:
+        st.markdown("**Документы (векторный поиск):**")
+        for d in docs:
+            st.markdown(f"- `[{d['doc_id']}]` {d['title']} — score {d['score']:.3f}")
+
+    facts = sources.get("graph_facts") or []
+    if facts:
+        st.markdown("**Факты из графа знаний:**")
+        for f in facts[:15]:
+            st.markdown(f"- {f['subject']} → *{f['predicate']}* → {f['object']}")
+        if len(facts) > 15:
+            st.caption(f"...и ещё {len(facts) - 15}")
+
+    if not (entities or docs or facts):
+        st.caption("Источники не найдены — ответ, скорее всего, вне корпуса.")
+
+
 with chat_tab:
     if "messages" not in st.session_state:
         st.session_state.messages = []
+
+    if not st.session_state.messages:
+        st.markdown("👋 Спроси что-нибудь про корпус, или начни с примера:")
+        cols = st.columns(len(EXAMPLE_QUESTIONS))
+        for col, example in zip(cols, EXAMPLE_QUESTIONS):
+            if col.button(example, use_container_width=True):
+                question = example
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("sources"):
                 with st.expander("Источники"):
-                    st.json(message["sources"])
+                    _render_sources(message["sources"])
 
     if question:
         st.session_state.messages.append({"role": "user", "content": question})
@@ -77,7 +118,7 @@ with chat_tab:
                 "graph_facts": result["graph_facts"],
             }
             with st.expander("Источники"):
-                st.json(sources)
+                _render_sources(sources)
 
         st.session_state.messages.append(
             {"role": "assistant", "content": result["answer"], "sources": sources}

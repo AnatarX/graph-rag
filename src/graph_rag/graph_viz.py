@@ -29,7 +29,10 @@ _TYPE_COLORS = {
 MAX_RENDER_NODES = 5000
 
 # Минимальный масштаб после auto-fit — ниже этого узлы/подписи превращаются в кашу.
-_MIN_SCALE = 0.45
+# Намеренно большой: на графе в 1000+ узлов auto-fit почти всегда хочет зумить сильно
+# дальше (чтобы влезло всё разом), а нам нужно, чтобы то, что видно на первом экране,
+# было крупным и читаемым, даже ценой того, что весь граф целиком не влезает без панорамирования.
+_MIN_SCALE = 1.3
 
 
 def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: str = "600px") -> str:
@@ -52,7 +55,11 @@ def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: s
 
     subgraph = G.subgraph(nodes)
     degree = dict(subgraph.degree())
-    pos = nx.spring_layout(subgraph, seed=42) if nodes else {}
+    # k — оптимальное расстояние между узлами в spring_layout; дефолт 1/sqrt(n) на графе
+    # в 1000+ узлов даёт слишком плотную укладку. Увеличиваем в несколько раз, чтобы
+    # между узлами было заметно больше пространства.
+    k = 8 / (len(nodes) ** 0.5) if nodes else None
+    pos = nx.spring_layout(subgraph, seed=42, k=k) if nodes else {}
 
     net = Network(height=height, width="100%", directed=True, notebook=False, cdn_resources="in_line")
     net.set_options(
@@ -75,8 +82,8 @@ def build_pyvis_html(G: nx.MultiDiGraph, keys: set[str] | None = None, height: s
             title=f"{data['name']} ({data['type']}) — упомянут в {len(data['doc_ids'])} док.",
             color=_TYPE_COLORS.get(data["type"], _TYPE_COLORS["other"]),
             size=size,
-            x=float(x) * 800,
-            y=float(y) * 800,
+            x=float(x) * 2500,
+            y=float(y) * 2500,
         )
 
     for u, v, data in G.edges(data=True):
