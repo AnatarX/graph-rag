@@ -27,6 +27,8 @@ GRAPH_HOPS = 1
 ENTITY_MATCH_SCORE_CUTOFF = 80
 MAX_ENTITY_MATCHES = 5
 SNIPPET_CHARS = 400
+HISTORY_USER_TURNS_FOR_RETRIEVAL = 2
+MAX_HISTORY_MESSAGES = 12  # последние 6 пар вопрос/ответ — дальше историю обрезаем
 
 _SYSTEM_PROMPT = """\
 Ты отвечаешь на вопросы, используя ТОЛЬКО предоставленный контекст (фрагменты документов
@@ -74,6 +76,24 @@ def _find_query_entities(G, query: str) -> list[str]:
         query, choices, scorer=fuzz.partial_ratio, limit=MAX_ENTITY_MATCHES
     )
     return [key for _, score, key in matches if score >= ENTITY_MATCH_SCORE_CUTOFF]
+
+
+def _contextual_query(query: str, history: list[dict] | None) -> str:
+    """Дополняет вопрос именами/темами из недавних реплик пользователя.
+
+    Нужно для follow-up вопросов вида "а когда он родился?" — сам по себе такой
+    вопрос не содержит имени, поэтому ни эмбеддинг, ни fuzzy-match сущностей в
+    графе (см. `_find_query_entities`) не находят Tony Blair. Берём только
+    реплики пользователя (не ответы ассистента) — они короче и обычно как раз
+    содержат имя, тогда как ответ ассистента длинный и может размыть эмбеддинг.
+    """
+    if not history:
+        return query
+    user_turns = [m["content"] for m in history if m.get("role") == "user"]
+    recent = user_turns[-HISTORY_USER_TURNS_FOR_RETRIEVAL:]
+    if not recent:
+        return query
+    return " ".join(recent) + " " + query
 
 
 def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> RetrievalResult:
@@ -143,14 +163,25 @@ def _leaked_cjk(text: str, query: str) -> bool:
     return bool(_CJK_RE.search(text)) and not _CJK_RE.search(query)
 
 
-def answer(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> dict:
-    retrieval = retrieve(query, top_k_docs=top_k_docs, hops=hops)
+def answer(
+    query: str,
+    history: list[dict] | None = None,
+    top_k_docs: int = TOP_K_DOCS,
+    hops: int = GRAPH_HOPS,
+) -> dict:
+    """`history` — предыдущие реплики диалога как `[{"role": "user"/"assistant", "content": str}]`,
+    без текущего вопроса. Используется и для retrieval (см. `_contextual_query`), и передаётся
+    LLM как есть, чтобы follow-up вопросы ("а когда он родился?") разрешались в контексте
+    предыдущих реплик, а не терялись."""
+    history = history[-MAX_HISTORY_MESSAGES:] if history else history
+    search_query = _contextual_query(query, history)
+    retrieval = retrieve(search_query, top_k_docs=top_k_docs, hops=hops)
     context = _build_context_block(retrieval)
 
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {query}"},
-    ]
+    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {query}"})
     response_text = chat_complete(messages, max_tokens=800, use_cache=False)
     if _leaked_cjk(response_text, query):
         # temperature=0 (жадное декодирование) детерминированно застревает в

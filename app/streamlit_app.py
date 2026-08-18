@@ -111,6 +111,12 @@ with chat_tab:
                     _render_sources(message["sources"])
 
     if question:
+        # История берётся ДО добавления текущего вопроса — в rag.answer() это
+        # предыдущие реплики диалога, а не включая тот вопрос, на который сейчас
+        # отвечаем. role/content без "sources", т.к. это UI-специфичное поле.
+        history = [
+            {"role": m["role"], "content": m["content"]} for m in st.session_state.messages
+        ]
         st.session_state.messages.append({"role": "user", "content": question})
         with st.chat_message("user"):
             st.markdown(question)
@@ -118,7 +124,7 @@ with chat_tab:
         with st.chat_message("assistant"):
             with st.spinner("Ищу контекст и генерирую ответ..."):
                 try:
-                    result = answer(question)
+                    result = answer(question, history=history)
                 except Exception as exc:  # noqa: BLE001 — показываем ошибку пользователю как есть
                     st.error(f"Ошибка при обращении к LLM-провайдеру: {exc}")
                     st.stop()
