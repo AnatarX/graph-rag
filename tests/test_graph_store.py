@@ -40,6 +40,45 @@ def test_case_variants_merge_into_one_node():
     assert {"Apple", "apple"} <= G.nodes["apple"]["aliases"]
 
 
+def test_same_person_different_name_forms_merge_into_one_node():
+    extractions = [
+        {
+            "doc_id": "d1",
+            "entities": [{"name": "Tony Blair", "type": "person"}],
+            "relations": [],
+        },
+        {
+            "doc_id": "d2",
+            # Другая статья называет его просто по фамилии — должно схлопнуться
+            # в тот же узел, что и "Tony Blair", а не создать дубль.
+            "entities": [{"name": "Blair", "type": "person"}],
+            "relations": [],
+        },
+    ]
+    G = build_graph(extractions)
+    assert G.number_of_nodes() == 1
+    node = G.nodes["tony blair"]
+    assert node["doc_ids"] == {"d1", "d2"}
+    assert {"Tony Blair", "Blair"} <= node["aliases"]
+
+
+def test_shared_first_name_does_not_merge_different_people():
+    extractions = [
+        {
+            "doc_id": "d1",
+            "entities": [{"name": "Michael Howard", "type": "person"}],
+            "relations": [],
+        },
+        {
+            "doc_id": "d2",
+            "entities": [{"name": "Michael Jackson", "type": "person"}],
+            "relations": [],
+        },
+    ]
+    G = build_graph(extractions)
+    assert G.number_of_nodes() == 2
+
+
 def test_shortest_path_across_two_hops():
     G = build_graph(EXTRACTIONS)
     result = shortest_path(G, "Tim Cook", "London")

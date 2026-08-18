@@ -5,9 +5,14 @@
 написания). Ребро — направленная связь subject -> object с predicate и списком
 doc_id, где эта связь была упомянута.
 
-Нормализация именно строковая (casefold), а не embedding-based entity resolution —
-осознанное упрощение для 100 документов: точных дублей достаточно, чтобы граф не
-разваливался на дубли узлов внутри одного датасета новостей. На большом и шумном
+Точное совпадение после нормализации схлопывает разное написание ОДНОЙ И ТОЙ ЖЕ формы
+имени, но не разные формы одного человека в разных документах: LLM извлекает сущность
+в том написании, что стоит в конкретном тексте (см. graph_extraction.py), поэтому одна
+статья даёт "Tony Blair", а другая — просто "Blair". Без доп. резолюции это были бы два
+разных узла графа. `_resolve_node_key` схлопывает такие случаи по правилу "общая
+фамилия/последний токен + один набор токенов вложен в другой" (см. `_is_alias_of`) —
+токенная эвристика, а не embedding-based entity resolution: осознанное упрощение для
+100 документов, дешёвое и достаточно точное на этом масштабе. На большом и шумном
 датасете это первое, что перестанет работать (см. README, раздел про масштаб).
 """
 
@@ -31,6 +36,38 @@ def _normalize(name: str) -> str:
     return " ".join(name.strip().casefold().split())
 
 
+def _is_alias_of(a_tokens: list[str], b_tokens: list[str]) -> bool:
+    """Считаем `a` другой формой того же имени, что и `b`, если оба заканчиваются
+    на один и тот же токен (фамилию/основное имя) и токены короткой формы — подмножество
+    токенов длинной. Так "Blair" — алиас "Tony Blair", а "Michael Howard" НЕ схлопывается
+    с "Michael Jackson" (общий только первый токен, фамилии разные)."""
+    if not a_tokens or not b_tokens or a_tokens[-1] != b_tokens[-1]:
+        return False
+    shorter, longer = (a_tokens, b_tokens) if len(a_tokens) <= len(b_tokens) else (b_tokens, a_tokens)
+    return set(shorter) <= set(longer)
+
+
+def _resolve_node_key(G: nx.MultiDiGraph, name: str, entity_type: str) -> str:
+    """Ключ узла для сущности `name`: существующий узел (точное совпадение или алиас —
+    см. `_is_alias_of`) либо новый нормализованный ключ, если совпадений нет.
+
+    Алиасы ищем только среди узлов совместимого типа: точное совпадение типов, либо
+    `entity_type == "other"` (сущности, добавленные из relations, где тип неизвестен, —
+    там намеренно ищем среди всех типов) или существующий узел ещё имеет тип "other" по
+    той же причине."""
+    key = _normalize(name)
+    if not key or key in G:
+        return key
+    tokens = key.split()
+    for existing_key, data in G.nodes(data=True):
+        existing_type = data.get("type", "other")
+        if entity_type != "other" and existing_type != "other" and existing_type != entity_type:
+            continue
+        if _is_alias_of(tokens, existing_key.split()):
+            return existing_key
+    return key
+
+
 def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
     G = nx.MultiDiGraph()
     name_counts: dict[str, Counter] = {}
@@ -38,19 +75,24 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
     for doc in extractions:
         doc_id = doc["doc_id"]
         for entity in doc["entities"]:
-            key = _normalize(entity["name"])
+            etype = entity.get("type", "other")
+            key = _resolve_node_key(G, entity["name"], etype)
             if not key:
                 continue
             if key not in G:
-                G.add_node(key, type=entity.get("type", "other"), doc_ids=set(), aliases=set())
+                G.add_node(key, type=etype, doc_ids=set(), aliases=set())
                 name_counts[key] = Counter()
+            elif G.nodes[key]["type"] == "other" and etype != "other":
+                # Узел мог быть создан раньше через relations (там тип сущности не
+                # известен, см. ниже) — как только встречаем реальный тип, уточняем.
+                G.nodes[key]["type"] = etype
             G.nodes[key]["doc_ids"].add(doc_id)
             G.nodes[key]["aliases"].add(entity["name"])
             name_counts[key][entity["name"]] += 1
 
         for relation in doc["relations"]:
-            skey = _normalize(relation["subject"])
-            okey = _normalize(relation["object"])
+            skey = _resolve_node_key(G, relation["subject"], "other")
+            okey = _resolve_node_key(G, relation["object"], "other")
             predicate = relation["predicate"]
             if not skey or not okey:
                 continue
