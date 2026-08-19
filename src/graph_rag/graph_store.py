@@ -28,6 +28,7 @@ import typer
 from rapidfuzz import fuzz, process
 
 from graph_rag.config import settings
+from graph_rag.graph_extraction import is_valid_entity_name
 
 GRAPH_PATH = settings.artifacts_dir / "graph.json"
 
@@ -69,12 +70,20 @@ def _resolve_node_key(G: nx.MultiDiGraph, name: str, entity_type: str) -> str:
 
 
 def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
+    """Собирает граф из LLM-экстракций. Записи, где subject/object/entity — не короткое
+    имя сущности, а целая фраза/предложение (LLM это иногда делает, вопреки промпту —
+    см. `graph_extraction.is_valid_entity_name`), отбрасываются здесь же: это дешёвая
+    защита, которая чистит и уже закэшированные extractions.json задним числом, без
+    повторного вызова LLM (сам extract_from_text тоже фильтрует на входе — для новых
+    вызовов, — но старые кэшированные данные написаны до этого фильтра)."""
     G = nx.MultiDiGraph()
     name_counts: dict[str, Counter] = {}
 
     for doc in extractions:
         doc_id = doc["doc_id"]
         for entity in doc["entities"]:
+            if not is_valid_entity_name(entity["name"]):
+                continue
             etype = entity.get("type", "other")
             key = _resolve_node_key(G, entity["name"], etype)
             if not key:
@@ -91,6 +100,8 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
             name_counts[key][entity["name"]] += 1
 
         for relation in doc["relations"]:
+            if not is_valid_entity_name(relation["subject"]) or not is_valid_entity_name(relation["object"]):
+                continue
             skey = _resolve_node_key(G, relation["subject"], "other")
             okey = _resolve_node_key(G, relation["object"], "other")
             predicate = relation["predicate"]

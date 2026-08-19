@@ -28,9 +28,17 @@ _SYSTEM_PROMPT = """\
 Ты извлекаешь сущности и связи между ними из новостного текста для построения графа знаний.
 
 Сущности: люди, организации, места, продукты — только те, что явно упомянуты в тексте.
-Связи: тройки (subject, predicate, object), где subject и object — сущности из списка entities,
-а predicate — короткая глагольная фраза на английском (например "works_for", "located_in",
-"acquired", "met_with").
+Имя сущности — короткое настоящее имя (обычно 1-6 слов), как "Tony Blair" или
+"International Association of Athletics Federations", а НЕ фраза и не предложение из
+текста. Если для места в тексте нет короткого собственного имени — не создавай из него
+сущность.
+
+Связи: тройки (subject, predicate, object), где subject и object — сущности из списка entities
+(с тем же ограничением на длину имени), а predicate — короткая глагольная фраза на английском
+(например "works_for", "located_in", "acquired", "met_with"). Постарайся дать хотя бы одну
+связь для каждой сущности из списка entities, если из текста можно вывести любую осмысленную
+связь (в том числе слабую, например "mentioned_in", "participated_in") — не оставляй сущность
+совсем без связей, если её роль в тексте хоть как-то понятна.
 
 Ответь СТРОГО валидным JSON без пояснений, в формате:
 {"entities": [{"name": "...", "type": "person|organization|location|product|other"}],
@@ -45,6 +53,30 @@ class DocExtraction:
     doc_id: str
     entities: list[dict] = field(default_factory=list)
     relations: list[dict] = field(default_factory=list)
+
+
+# Промпт просит "имена сущностей в исходном написании, без сокращений и добавленных
+# пояснений", но LLM это не всегда соблюдает — иногда вместо короткого имени в subject/
+# object триплета или в entities попадает целая фраза/предложение из текста статьи
+# (например, "52% rise in profits for the year to £198m from the £130m seen a year
+# earlier" вместо настоящей сущности). Порог в 6 слов подобран так, чтобы не резать
+# легитимные длинные названия организаций/изданий (например, "international association
+# of athletics federations" — 6 слов), но отсечь клаузы/предложения — на реальных данных
+# датасета 7+ слов почти без исключений оказывались мусором, а не именами.
+_MAX_ENTITY_NAME_WORDS = 6
+
+
+def is_valid_entity_name(name: str) -> bool:
+    """True, если `name` похоже на короткое имя сущности, а не на фразу/предложение
+    (см. `_MAX_ENTITY_NAME_WORDS`). Используется и здесь при извлечении (фильтрует
+    будущие LLM-вызовы), и в graph_store.build_graph (чистит уже закэшированные
+    extractions.json задним числом, без повторного вызова LLM)."""
+    name = name.strip()
+    if not name:
+        return False
+    if name.endswith((".", "!", "?")):
+        return False
+    return len(name.split()) <= _MAX_ENTITY_NAME_WORDS
 
 
 def _parse_json(raw: str) -> dict:
@@ -72,11 +104,20 @@ def extract_from_text(doc_id: str, text: str) -> DocExtraction:
     except (json.JSONDecodeError, AttributeError):
         return DocExtraction(doc_id=doc_id)
 
-    entities = [e for e in data.get("entities", []) if isinstance(e, dict) and e.get("name")]
+    entities = [
+        e
+        for e in data.get("entities", [])
+        if isinstance(e, dict) and e.get("name") and is_valid_entity_name(e["name"])
+    ]
     relations = [
         r
         for r in data.get("relations", [])
-        if isinstance(r, dict) and r.get("subject") and r.get("object") and r.get("predicate")
+        if isinstance(r, dict)
+        and r.get("subject")
+        and r.get("object")
+        and r.get("predicate")
+        and is_valid_entity_name(r["subject"])
+        and is_valid_entity_name(r["object"])
     ]
     return DocExtraction(doc_id=doc_id, entities=entities, relations=relations)
 

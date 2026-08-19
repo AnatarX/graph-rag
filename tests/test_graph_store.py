@@ -79,6 +79,33 @@ def test_shared_first_name_does_not_merge_different_people():
     assert G.number_of_nodes() == 2
 
 
+def test_sentence_like_entity_and_relation_participants_are_dropped():
+    extractions = [
+        {
+            "doc_id": "d1",
+            "entities": [
+                {"name": "Tony Blair", "type": "person"},
+                # LLM иногда подставляет целую фразу вместо короткого имени сущности —
+                # см. graph_extraction.is_valid_entity_name.
+                {"name": "he probably has his own airplane seat that is how highly sony prize him", "type": "other"},
+            ],
+            "relations": [
+                {"subject": "Tony Blair", "predicate": "leads", "object": "UK"},
+                {
+                    "subject": "Tony Blair",
+                    "predicate": "caused",
+                    "object": "52% rise in profits for the year to £198m from the £130m seen a year earlier",
+                },
+            ],
+        }
+    ]
+    G = build_graph(extractions)
+    assert "tony blair" in G.nodes
+    assert "uk" in G.nodes
+    assert G.number_of_nodes() == 2
+    assert G.number_of_edges() == 1
+
+
 def test_shortest_path_across_two_hops():
     G = build_graph(EXTRACTIONS)
     result = shortest_path(G, "Tim Cook", "London")

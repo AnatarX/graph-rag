@@ -170,14 +170,22 @@ def _render_graph_tab() -> None:
             keys = neighborhood_keys(G, query, hops)
             if keys is None:
                 st.warning("Не нашёл такую сущность в графе.")
-    # mode == "Весь граф" — keys остаётся None, build_pyvis_html рисует весь G
-    # (с обрезкой до MAX_RENDER_NODES самых связанных — см. graph_viz.py)
+    # mode == "Весь граф" — keys остаётся None, build_pyvis_html рисует весь G без
+    # полностью изолированных узлов (с обрезкой до MAX_RENDER_NODES самых связанных
+    # среди оставшихся, если нужно — см. graph_viz.py)
 
-    if mode == "Весь граф" and G.number_of_nodes() > MAX_RENDER_NODES:
-        st.caption(
-            f"В графе {G.number_of_nodes()} узлов — рендер такого количества виснет в "
-            f"браузере (vis.js), показаны {MAX_RENDER_NODES} самых связанных."
-        )
+    if mode == "Весь граф":
+        isolated = sum(1 for _, d in G.degree() if d == 0)
+        if isolated:
+            st.caption(
+                f"{isolated} сущностей без единой связи не показаны — у них нет ничего, "
+                "что определяло бы их позицию на графе связей."
+            )
+        if G.number_of_nodes() - isolated > MAX_RENDER_NODES:
+            st.caption(
+                f"В графе {G.number_of_nodes() - isolated} связанных узлов — рендер такого "
+                f"количества виснет в браузере (vis.js), показаны {MAX_RENDER_NODES} самых связанных."
+            )
 
     if mode != "Окрестность сущности" or keys:
         # "Весь граф" — заметно больше узлов на экране, чем в остальных режимах, поэтому
