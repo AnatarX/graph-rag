@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from graph_rag.config import settings
@@ -107,19 +108,25 @@ _EXTRACTION_MAX_TOKENS = 1200
 _EXTRACTION_RETRY_MAX_TOKENS = 2400
 
 
-def extract_from_text(doc_id: str, text: str) -> DocExtraction:
+def extract_from_text(doc_id: str, text: str, use_cache: bool = True) -> DocExtraction:
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
     try:
-        raw = chat_complete(messages, response_format={"type": "json_object"}, max_tokens=_EXTRACTION_MAX_TOKENS)
+        raw = chat_complete(
+            messages,
+            response_format={"type": "json_object"},
+            max_tokens=_EXTRACTION_MAX_TOKENS,
+            use_cache=use_cache,
+        )
     except LLMResponseError:
         try:
             raw = chat_complete(
                 messages,
                 response_format={"type": "json_object"},
                 max_tokens=_EXTRACTION_RETRY_MAX_TOKENS,
+                use_cache=use_cache,
             )
         except LLMResponseError as exc:
             print(
@@ -155,23 +162,42 @@ def extract_from_text(doc_id: str, text: str) -> DocExtraction:
     return DocExtraction(doc_id=doc_id, entities=entities, relations=relations)
 
 
+# LLM-вызовы I/O-bound (сетевой запрос, ожидание ответа) — GIL не мешает параллелить их
+# потоками. 10 воркеров — тот же порядок, что и пример из ревью (100 документов
+# последовательно: 13.5 минут; в 10 потоков: ~4 минуты).
+_EXTRACTION_WORKERS = 10
+
+
 def build_extractions(force: bool = False) -> list[dict]:
     if EXTRACTIONS_PATH.exists() and not force:
         return json.loads(EXTRACTIONS_PATH.read_text(encoding="utf-8"))
 
     docs = load_saved_corpus()
-    results = []
     total = len(docs)
-    for i, (_, row) in enumerate(docs.iterrows(), start=1):
-        print(f"  [{i}/{total}] {row['doc_id']}", flush=True)
-        extraction = extract_from_text(row["doc_id"], row["text"])
-        results.append(
-            {
-                "doc_id": extraction.doc_id,
-                "entities": extraction.entities,
-                "relations": extraction.relations,
-            }
-        )
+    # force=True должен означать честный новый вызов LLM, а не старый ответ из
+    # дискового llm_cache по тому же промпту (см. llm_client._cache_key) — иначе
+    # --force чистит только extractions.json, но не сам источник "залипания".
+    use_cache = not force
+
+    def _extract(row: tuple) -> DocExtraction:
+        _, r = row
+        return extract_from_text(r["doc_id"], r["text"], use_cache=use_cache)
+
+    results = []
+    # executor.map сохраняет порядок аргументов (не порядок завершения), поэтому
+    # результаты выстраиваются в исходном порядке документов, а печать прогресса —
+    # в основном потоке по мере получения из map — тоже последовательная, без
+    # доп. синхронизации между воркерами.
+    with ThreadPoolExecutor(max_workers=_EXTRACTION_WORKERS) as executor:
+        for i, extraction in enumerate(executor.map(_extract, docs.iterrows()), start=1):
+            print(f"  [{i}/{total}] {extraction.doc_id}", flush=True)
+            results.append(
+                {
+                    "doc_id": extraction.doc_id,
+                    "entities": extraction.entities,
+                    "relations": extraction.relations,
+                }
+            )
 
     settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
     EXTRACTIONS_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

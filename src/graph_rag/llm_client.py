@@ -82,6 +82,16 @@ def get_access_token() -> str:
     return token
 
 
+# Кэш клиента, привязанный к текущему api_key: пересоздаём OpenAI-клиент (а с ним и
+# httpx.Client с его пулом TCP/TLS-соединений внутри) только когда api_key реально
+# изменился с прошлого раза, а не на каждый вызов. Для статического LLM_API_KEY он
+# никогда не меняется — клиент создаётся один раз за весь процесс. Для IAM-токена
+# (LLM_KEY_ID/LLM_KEY_SECRET) get_access_token() сам возвращает новый токен ровно тогда,
+# когда старый истёк (раз в час, см. _token_cache) — клиент пересобирается синхронно с
+# этим, не чаще и не реже, так что долгоживущие батчи не сломаются после ротации токена.
+_client_cache: dict[str, object] = {}
+
+
 def get_client() -> OpenAI:
     """Возвращает OpenAI-клиент, авторизованный для настроенного LLM-провайдера.
 
@@ -91,15 +101,32 @@ def get_client() -> OpenAI:
     - `LLM_KEY_ID`/`LLM_KEY_SECRET` — ключ сервисного аккаунта cloud.ru, требует
       обмена на короткоживущий IAM access-token (см. `get_access_token`).
 
-    Клиент дешёвый в создании, поэтому пересобираем его при каждом вызове —
-    так гарантированно используется свежий токен без ручного отслеживания
-    момента протухания на стороне вызывающего кода.
+    Клиент кэшируется по api_key (см. `_client_cache`) — пересоздаётся только когда
+    api_key поменялся, а не на каждый вызов, чтобы переиспользовать TCP/TLS-соединения
+    (пул внутри httpx.Client) между запросами, а не открывать новое соединение на
+    каждый из сотен LLM-вызовов.
     """
     api_key = settings.llm_api_key or get_access_token()
-    return OpenAI(api_key=api_key, base_url=settings.llm_base_url)
+    cached_key = _client_cache.get("api_key")
+    if cached_key == api_key:
+        return _client_cache["client"]  # type: ignore[return-value]
+
+    client = OpenAI(api_key=api_key, base_url=settings.llm_base_url)
+    _client_cache["api_key"] = api_key
+    _client_cache["client"] = client
+    return client
 
 
 def _cache_key(kind: str, payload: dict) -> str:
+    """Ключ дискового кэша — хэш от `payload`, куда для chat-запросов входит полный
+    `messages` (включая system prompt). Поэтому правка промпта автоматически даёт
+    НОВЫЙ ключ — старые записи под старым ключом никогда не возвращаются по ошибке.
+
+    Но это не бесплатно: старые записи от прошлых версий промпта после такой правки
+    никуда не деваются — просто перестают находиться и остаются мусором на диске
+    без TTL и автоочистки. Для ручной уборки см. `clear_cache()` / `cache-clear` в CLI
+    этого модуля. Для принудительного обхода кэша на конкретном вызове (не то же самое,
+    что очистка) см. параметр `use_cache` у `chat_complete`/`embed_texts`."""
     raw = json.dumps({"kind": kind, **payload}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -123,6 +150,20 @@ def _cache_set(key: str, payload: dict, result: object) -> None:
     )
 
 
+def clear_cache() -> int:
+    """Удаляет всё содержимое дискового кэша (`settings.llm_cache_dir`) — ручная уборка
+    мусора, накопившегося от старых версий промпта (см. `_cache_key`), т.к. TTL/автоочистки
+    нет. Возвращает число удалённых файлов. Доступна и как функция, и как CLI-команда
+    `cache-clear` (`uv run python -m graph_rag.llm_client cache-clear`)."""
+    if not settings.llm_cache_dir.exists():
+        return 0
+    removed = 0
+    for path in settings.llm_cache_dir.glob("*.json"):
+        path.unlink()
+        removed += 1
+    return removed
+
+
 @retry(
     retry=retry_if_exception_type(_RETRYABLE),
     wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -138,7 +179,14 @@ def chat_complete(
     max_tokens: int | None = None,
     use_cache: bool = True,
 ) -> str:
-    """Один chat-completion запрос, возвращает текст ответа. Кэшируется по содержимому запроса.
+    """Один chat-completion запрос, возвращает текст ответа. Кэшируется по содержимому
+    запроса (включая `messages`, то есть и system prompt — см. `_cache_key`), поэтому
+    правка промпта сама по себе не потребует чистки кэша руками для НОВЫХ вызовов, но
+    старые записи под старым промптом останутся мусором на диске (см. `clear_cache`).
+
+    `use_cache=False` обходит именно этот дисковый кэш на конкретном вызове (не путать
+    с его очисткой) — так `build_extractions(force=True)` гарантирует честный новый
+    вызов LLM, а не старый закэшированный ответ по тому же промпту.
 
     `max_tokens` — обязательная подстраховка для маленьких локальных моделей на
     temperature=0: без верхней границы жадное декодирование иногда срывается в
@@ -262,6 +310,18 @@ def _cli_models() -> None:
     """
     for model_id in list_models():
         typer.echo(model_id)
+
+
+@cli.command("cache-clear")
+def _cli_cache_clear() -> None:
+    """Удалить весь дисковый кэш LLM-запросов (settings.llm_cache_dir) — например,
+    после правки системного промпта, когда старые записи под старым ключом (см.
+    `_cache_key`) больше не находятся, но продолжают занимать место на диске.
+
+    Запуск: `uv run python -m graph_rag.llm_client cache-clear`.
+    """
+    removed = clear_cache()
+    typer.echo(f"Удалено файлов кэша: {removed}")
 
 
 @cli.callback(invoke_without_command=True)

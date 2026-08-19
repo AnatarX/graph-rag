@@ -18,10 +18,34 @@ import numpy as np
 from rapidfuzz import fuzz, process, utils as fuzz_utils
 
 from graph_rag.clustering import l2_normalize
-from graph_rag.embeddings import load_embeddings
+from graph_rag.config import settings
+from graph_rag.embeddings import EMBEDDINGS_PATH, load_embeddings
 from graph_rag.graph_store import GRAPH_PATH, k_hop_neighbors, load_graph
 from graph_rag.ingest import load_saved_corpus
 from graph_rag.llm_client import chat_complete, embed_texts
+
+DOCS_PATH = settings.artifacts_dir / "docs.parquet"
+
+# In-process кэш по (путь файла, mtime): retrieve() вызывается на каждый вопрос в чате,
+# и без этого docs.parquet/embeddings.npy/graph.json (1157 узлов) перечитывались бы с
+# диска заново на каждый вопрос — в UI кэш через @st.cache_resource стоит только на
+# вкладке "Граф", чат им не пользуется. Ключ по mtime, а не голый functools.lru_cache():
+# в долгоживущем процессе (Streamlit) артефакты пересобираются вручную (`pipeline build`)
+# в рамках итеративной разработки, и lru_cache держал бы старые данные в памяти после
+# ребилда — это хуже, чем текущее "перечитываем каждый раз". При смене mtime кэш сам
+# инвалидируется и подхватывает новый файл.
+_load_cache: dict[str, tuple[float, object]] = {}
+
+
+def _cached(path, loader):
+    mtime = path.stat().st_mtime
+    cached = _load_cache.get(str(path))
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    value = loader()
+    _load_cache[str(path)] = (mtime, value)
+    return value
+
 
 TOP_K_DOCS = 5
 GRAPH_HOPS = 1
@@ -144,8 +168,8 @@ def _truncate_at_sentence(text: str, limit: int) -> str:
 
 
 def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> RetrievalResult:
-    docs = load_saved_corpus()
-    embeddings = load_embeddings()
+    docs = _cached(DOCS_PATH, load_saved_corpus)
+    embeddings = _cached(EMBEDDINGS_PATH, load_embeddings)
     query_vec = embed_texts([query])[0]
 
     # Переиспользуем l2_normalize из clustering.py вместо дублирования подсчёта норм —
@@ -174,7 +198,7 @@ def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -
     graph_facts: list[GraphFact] = []
     matched_entities: list[str] = []
     if GRAPH_PATH.exists():
-        G = load_graph()
+        G = _cached(GRAPH_PATH, load_graph)
         for key in _find_query_entities(G, query):
             info = k_hop_neighbors(G, G.nodes[key]["name"], hops=hops)
             if info is None:
