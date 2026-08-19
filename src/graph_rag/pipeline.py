@@ -68,6 +68,24 @@ def build(force: bool = typer.Option(False, "--force", help="Пересчита�
         attach_clusters(G, doc_clusters)
         save_graph(G)
         typer.echo(f"      {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер")
+
+        # Числа узлов/рёбер зависят от модели, которая извлекала граф (см. README,
+        # раздел "Срезанные углы") — без привязки к модели и дате прогона они
+        # невоспроизводимы и бесполезны для проверки. Фиксируем это здесь же, а не
+        # печатаем только в консоль.
+        from datetime import datetime, timezone
+
+        run_metadata = {
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "chat_model": settings.llm_chat_model,
+            "embed_model": settings.llm_embed_model,
+            "n_docs": len(docs),
+            "graph_nodes": G.number_of_nodes(),
+            "graph_edges": G.number_of_edges(),
+        }
+        metadata_path = settings.artifacts_dir / "run_metadata.json"
+        metadata_path.write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        typer.echo(f"      метаданные прогона -> {metadata_path}")
     else:
         typer.echo("[5/5] graph_store: уже есть, пропускаю")
 
