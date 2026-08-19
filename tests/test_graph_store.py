@@ -135,6 +135,10 @@ def test_docs_linked_to_cluster_reaches_beyond_cluster():
 
     result = docs_linked_to_cluster(G, cluster_id=0, doc_clusters=doc_clusters)
     assert result["cluster_doc_ids"] == ["d1"]
-    # d1 упоминает Apple, Apple также упомянута в d2 (кластер 1) -> граф "дотягивается" до d2
-    assert "d2" in result["extra_doc_ids_via_graph"]
+    # d1 упоминает Apple, Apple также упомянута в d2 (кластер 1) -> граф "дотягивается" до d2,
+    # с указанием, через сколько общих сущностей (тут Apple и Tim Cook -> и Apple связывает
+    # d1/d2, при этом Tim Cook в d2 не упомянут, так что общих сущностей ровно 1: Apple).
+    extra_doc_ids = [entry["doc_id"] for entry in result["extra_doc_ids_via_graph"]]
+    assert "d2" in extra_doc_ids
+    assert all("shared_entities" in entry for entry in result["extra_doc_ids_via_graph"])
     assert "d3" not in result["linked_doc_ids"]

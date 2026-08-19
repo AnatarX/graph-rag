@@ -78,6 +78,14 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
     вызовов, — но старые кэшированные данные написаны до этого фильтра)."""
     G = nx.MultiDiGraph()
     name_counts: dict[str, Counter] = {}
+    # Тип узла — голосование большинством среди всех НЕ-"other" типов, с которыми
+    # сущность встретилась (по всем документам), а не тип первого попавшегося
+    # упоминания: LLM не всегда стабильно типизирует одну и ту же сущность одинаково
+    # в разных документах, и "первый встреченный" тип — произвольный выбор, который
+    # может быть менее частым, чем правильный. Узлы, пришедшие только из relations
+    # (там типа вообще нет), сюда ничего не добавляют и остаются "other" — это
+    # единственная причина, по которой узел может остаться "other" в итоге.
+    type_counts: dict[str, Counter] = {}
 
     for doc in extractions:
         doc_id = doc["doc_id"]
@@ -89,15 +97,13 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
             if not key:
                 continue
             if key not in G:
-                G.add_node(key, type=etype, doc_ids=set(), aliases=set())
+                G.add_node(key, type="other", doc_ids=set(), aliases=set())
                 name_counts[key] = Counter()
-            elif G.nodes[key]["type"] == "other" and etype != "other":
-                # Узел мог быть создан раньше через relations (там тип сущности не
-                # известен, см. ниже) — как только встречаем реальный тип, уточняем.
-                G.nodes[key]["type"] = etype
             G.nodes[key]["doc_ids"].add(doc_id)
             G.nodes[key]["aliases"].add(entity["name"])
             name_counts[key][entity["name"]] += 1
+            if etype != "other":
+                type_counts.setdefault(key, Counter())[etype] += 1
 
         for relation in doc["relations"]:
             if not is_valid_entity_name(relation["subject"]) or not is_valid_entity_name(relation["object"]):
@@ -122,6 +128,8 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
 
     for key, counts in name_counts.items():
         G.nodes[key]["name"] = counts.most_common(1)[0][0]
+        counts_by_type = type_counts.get(key)
+        G.nodes[key]["type"] = counts_by_type.most_common(1)[0][0] if counts_by_type else "other"
 
     return G
 
@@ -206,7 +214,10 @@ def shortest_path(G: nx.MultiDiGraph, source: str, target: str) -> dict | None:
 
     steps = []
     for a, b in zip(path, path[1:]):
-        edge_data = G.get_edge_data(a, b) or G.get_edge_data(b, a) or {}
+        # Рёбра могут существовать в оба направления (a->b И b->a, с разными
+        # predicate) — собираем предикаты из ОБОИХ направлений, а не только из
+        # первого найденного, иначе часть связей между парой узлов теряется молча.
+        edge_data = {**(G.get_edge_data(a, b) or {}), **(G.get_edge_data(b, a) or {})}
         predicates = [d["predicate"] for d in edge_data.values()]
         steps.append({"from": G.nodes[a]["name"], "to": G.nodes[b]["name"], "predicates": predicates})
     return {"path": [G.nodes[n]["name"] for n in path], "steps": steps}
@@ -254,20 +265,38 @@ def docs_linked_to_cluster(G: nx.MultiDiGraph, cluster_id: int, doc_clusters: pd
     """Документы кластера N + документы ВНЕ кластера, до которых можно дойти через
     общие сущности — это ровно то место, где граф даёт ценность поверх векторной
     кластеризации: документы, не похожие по эмбеддингу целиком, но связанные через
-    конкретную сущность (человека/компанию/место)."""
+    конкретную сущность (человека/компанию/место).
+
+    "Мостовой" считается сущность, встреченная хотя бы в одном документе кластера —
+    но документы ВНЕ кластера ранжируются по числу РАЗНЫХ мостовых сущностей, которые
+    их связывают с кластером (а не просто перечисляются все как одна плоская "половина
+    корпуса"): документ, разделяющий с кластером 5 сущностей, — куда более осмысленная
+    находка, чем документ с одной случайной общей сущностью, и вызывающий код должен это
+    видеть."""
     cluster_doc_ids = set(doc_clusters.loc[doc_clusters["cluster_id"] == cluster_id, "doc_id"])
     bridge_entities = [
         (key, data["name"]) for key, data in G.nodes(data=True) if data["doc_ids"] & cluster_doc_ids
     ]
+    bridge_keys = [key for key, _ in bridge_entities]
+
     linked_doc_ids: set[str] = set()
-    for key, _ in bridge_entities:
-        linked_doc_ids |= G.nodes[key]["doc_ids"]
+    shared_counts: Counter[str] = Counter()
+    for key in bridge_keys:
+        doc_ids = G.nodes[key]["doc_ids"]
+        linked_doc_ids |= doc_ids
+        for doc_id in doc_ids - cluster_doc_ids:
+            shared_counts[doc_id] += 1
+
+    extra_doc_ids_via_graph = [
+        {"doc_id": doc_id, "shared_entities": count}
+        for doc_id, count in sorted(shared_counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
 
     return {
         "cluster_doc_ids": sorted(cluster_doc_ids),
         "bridge_entities": sorted(name for _, name in bridge_entities),
         "linked_doc_ids": sorted(linked_doc_ids),
-        "extra_doc_ids_via_graph": sorted(linked_doc_ids - cluster_doc_ids),
+        "extra_doc_ids_via_graph": extra_doc_ids_via_graph,
     }
 
 
@@ -309,7 +338,9 @@ def _cli_cluster(cluster_id: int) -> None:
     typer.echo(f"документов в кластере:        {len(result['cluster_doc_ids'])}")
     typer.echo(f"связанных через граф (всего): {len(result['linked_doc_ids'])}")
     typer.echo(f"из них ВНЕ кластера:          {len(result['extra_doc_ids_via_graph'])}")
-    typer.echo(f"  {result['extra_doc_ids_via_graph']}")
+    typer.echo("  ранжированы по числу общих (мостовых) сущностей с кластером:")
+    for entry in result["extra_doc_ids_via_graph"]:
+        typer.echo(f"    {entry['doc_id']}  (общих сущностей: {entry['shared_entities']})")
 
 
 if __name__ == "__main__":
