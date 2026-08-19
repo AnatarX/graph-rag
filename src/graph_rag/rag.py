@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from rapidfuzz import fuzz, process, utils as fuzz_utils
 
+from graph_rag.clustering import l2_normalize
 from graph_rag.embeddings import load_embeddings
 from graph_rag.graph_store import GRAPH_PATH, k_hop_neighbors, load_graph
 from graph_rag.ingest import load_saved_corpus
@@ -26,7 +27,25 @@ TOP_K_DOCS = 5
 GRAPH_HOPS = 1
 ENTITY_MATCH_SCORE_CUTOFF = 80
 MAX_ENTITY_MATCHES = 5
-SNIPPET_CHARS = 400
+# Медиана длины статьи в корпусе — 2137 символов (максимум 7121), так что этот лимит
+# покрывает медианную статью почти целиком, а не только её первые ~19%, как было при 400.
+# Полный чанкинг (раздельный эмбеддинг фрагментов документа) — отдельная архитектурная
+# задача; здесь прагматичный фикс на уровне окна контекста. Остаток режется по границе
+# предложения, а не посреди слова — см. `_truncate_at_sentence`.
+SNIPPET_CHARS = 2200
+# top_k_docs — потолок, а не гарантия: документы со score ниже порога отсекаются даже
+# если top_k ещё не набран (см. `retrieve`). Порог подобран по распределению попарных
+# косинусных сходств документов корпуса (l2-нормализованные эмбеддинги, artifacts/embeddings.npy):
+# минимум ~0.22, 5-й перцентиль ~0.30, медиана ~0.39 — то есть даже случайная пара статей
+# в этом корпусе для этой модели эмбеддингов даёт сходство заметно выше нуля (анизотропия
+# эмбеддинг-пространства — общая черта многих sentence-эмбеддеров). 0.2 — с запасом ниже
+# этого "фонового шума" корпуса: не отсекает документы, реально похожие на вопрос (пример
+# из ревью — 5-й документ со score 0.404 — проходит), но отсекает документы на вопросах,
+# которые вообще не по теме корпуса.
+MIN_DOC_SCORE = 0.2
+# То же число, что и лимит отображения фактов в UI (app/streamlit_app.py, _render_sources:
+# `facts[:15]`) — чтобы промпт LLM и то, что видит пользователь, не расходились.
+MAX_GRAPH_FACTS_IN_PROMPT = 15
 HISTORY_USER_TURNS_FOR_RETRIEVAL = 2
 MAX_HISTORY_MESSAGES = 12  # последние 6 пар вопрос/ответ — дальше историю обрезаем
 
@@ -107,22 +126,47 @@ def _contextual_query(query: str, history: list[dict] | None) -> str:
     return " ".join(recent) + " " + query
 
 
+def _truncate_at_sentence(text: str, limit: int) -> str:
+    """Обрезает текст до `limit` символов по границе предложения, а не голым `text[:limit]`
+    посреди слова. Ищет последний знак конца предложения (.!?) в пределах окна; если такого
+    нет (например, очень длинное первое предложение), откатывается на границу слова, а если
+    и пробела нет — на голый срез (только для патологических случаев без пробелов вообще)."""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    last_end = max(window.rfind("."), window.rfind("!"), window.rfind("?"))
+    if last_end != -1:
+        return window[: last_end + 1]
+    last_space = window.rfind(" ")
+    if last_space != -1:
+        return window[:last_space].rstrip() + "…"
+    return window + "…"
+
+
 def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> RetrievalResult:
     docs = load_saved_corpus()
     embeddings = load_embeddings()
     query_vec = embed_texts([query])[0]
 
-    doc_norms = np.linalg.norm(embeddings, axis=1)
-    query_norm = np.linalg.norm(query_vec)
-    sims = (embeddings @ query_vec) / (doc_norms * query_norm + 1e-8)
-    top_idx = np.argsort(-sims)[:top_k_docs]
+    # Переиспользуем l2_normalize из clustering.py вместо дублирования подсчёта норм —
+    # эмбеддинги документов нормализуются на каждый запрос заново (нормализация дешёвая
+    # относительно самого эмбеддинг-вызова), а не заранее и не кэшируются между вызовами:
+    # мемоизация — отдельная задача.
+    doc_unit = l2_normalize(embeddings)
+    query_unit = l2_normalize(query_vec.reshape(1, -1))[0]
+    sims = doc_unit @ query_unit
+
+    # top_k_docs — потолок, а не гарантия: сначала отсекаем документы ниже MIN_DOC_SCORE,
+    # и только потом берём не более top_k_docs из оставшихся (см. MIN_DOC_SCORE выше).
+    ranked_idx = np.argsort(-sims)
+    top_idx = [i for i in ranked_idx if sims[i] >= MIN_DOC_SCORE][:top_k_docs]
 
     vector_hits = [
         VectorHit(
             doc_id=docs.iloc[i]["doc_id"],
             score=float(sims[i]),
             title=docs.iloc[i]["title"],
-            snippet=docs.iloc[i]["text"][:SNIPPET_CHARS],
+            snippet=_truncate_at_sentence(docs.iloc[i]["text"], SNIPPET_CHARS),
         )
         for i in top_idx
     ]
@@ -153,11 +197,22 @@ def _build_context_block(retrieval: RetrievalResult) -> str:
     if retrieval.graph_facts:
         parts.append("\n## Факты из графа знаний")
         seen = set()
+        unique_facts: list[tuple[GraphFact, str]] = []
         for fact in retrieval.graph_facts:
             line = f"{fact.subject} --{fact.predicate}--> {fact.object} (источники: {', '.join(fact.doc_ids)})"
             if line not in seen:
                 seen.add(line)
-                parts.append(line)
+                unique_facts.append((fact, line))
+
+        # Для хабов (например, "Gordon Brown": 24 факта на 1 хопе, 49 на двух) без
+        # ранжирования и лимита все факты уезжают в промпт как равнозначные. Ранжируем
+        # по числу источников (len(doc_ids)) как прокси значимости факта — то, что
+        # подтверждено несколькими документами, важнее единичного упоминания — и
+        # обрезаем по MAX_GRAPH_FACTS_IN_PROMPT (сортировка стабильна, так что при
+        # равном числе источников порядок совпадает с порядком обнаружения фактов).
+        unique_facts.sort(key=lambda pair: len(pair[0].doc_ids), reverse=True)
+        for _, line in unique_facts[:MAX_GRAPH_FACTS_IN_PROMPT]:
+            parts.append(line)
 
     return "\n\n".join(parts)
 
