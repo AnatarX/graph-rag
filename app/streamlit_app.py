@@ -126,7 +126,15 @@ with chat_tab:
                 try:
                     result = answer(question, history=history)
                 except Exception as exc:  # noqa: BLE001 — показываем ошибку пользователю как есть
-                    st.error(f"Ошибка при обращении к LLM-провайдеру: {exc}")
+                    # Вопрос пользователя уже добавлен в историю (см. выше) — если здесь
+                    # прервать выполнение через st.stop(), он навсегда останется без ответа
+                    # в session_state, и чат будет молча "залипать" на нём при каждом
+                    # перерендере. Вместо этого кладём в историю сообщение об ошибке от
+                    # ассистента, чтобы диалог остался консистентным и юзер видел, что
+                    # запрос не прошёл, а не что его игнорируют.
+                    error_text = f"⚠️ Не удалось получить ответ от LLM-провайдера: {exc}"
+                    st.error(error_text)
+                    st.session_state.messages.append({"role": "assistant", "content": error_text})
                     st.stop()
             st.markdown(result["answer"])
             sources = {

@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 
 import numpy as np
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz, process, utils as fuzz_utils
 
 from graph_rag.embeddings import load_embeddings
 from graph_rag.graph_store import GRAPH_PATH, k_hop_neighbors, load_graph
@@ -69,11 +69,22 @@ class RetrievalResult:
 
 
 def _find_query_entities(G, query: str) -> list[str]:
+    """Fuzzy-матчит имена сущностей графа как ЦЕЛЫЕ слова/фразы в вопросе, а не как
+    произвольную подстроку: `fuzz.partial_ratio` раньше матчил короткие сущности вроде
+    "us" на "b-us-iness" (score 100) — любая сущность короче 4 символов (в графе таких
+    десятки) давала такие ложные срабатывания и тащила в промпт чужую окрестность.
+    `token_set_ratio` сравнивает по множеству токенов, так что совпадение требует общего
+    слова целиком; `processor=default_process` — регистронезависимое сравнение (иначе,
+    например, "Tony Blair" в вопросе не матчит узел с отображаемым именем "blair")."""
     if G.number_of_nodes() == 0:
         return []
     choices = {key: data["name"] for key, data in G.nodes(data=True)}
     matches = process.extract(
-        query, choices, scorer=fuzz.partial_ratio, limit=MAX_ENTITY_MATCHES
+        query,
+        choices,
+        scorer=fuzz.token_set_ratio,
+        processor=fuzz_utils.default_process,
+        limit=MAX_ENTITY_MATCHES,
     )
     return [key for _, score, key in matches if score >= ENTITY_MATCH_SCORE_CUTOFF]
 

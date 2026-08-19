@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from graph_rag.config import settings
 from graph_rag.ingest import load_saved_corpus
-from graph_rag.llm_client import chat_complete
+from graph_rag.llm_client import LLMResponseError, chat_complete
 
 EXTRACTIONS_PATH = settings.artifacts_dir / "extractions.json"
 
@@ -89,19 +89,41 @@ def _parse_json(raw: str) -> dict:
         return json.loads(match.group(0))
 
 
+_EXTRACTION_MAX_TOKENS = 1200
+# Ретрай при обрезанном ответе делает то же самое, но с большим запасом по токенам —
+# реальная причина обрезки почти всегда в max_tokens, а не в response_format (см.
+# llm_client.LLMResponseError), поэтому просто повторять без response_format бессмысленно.
+_EXTRACTION_RETRY_MAX_TOKENS = 2400
+
+
 def extract_from_text(doc_id: str, text: str) -> DocExtraction:
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": text},
     ]
     try:
-        raw = chat_complete(messages, response_format={"type": "json_object"}, max_tokens=1200)
-    except Exception:
-        raw = chat_complete(messages, max_tokens=1200)
+        raw = chat_complete(messages, response_format={"type": "json_object"}, max_tokens=_EXTRACTION_MAX_TOKENS)
+    except LLMResponseError:
+        try:
+            raw = chat_complete(
+                messages,
+                response_format={"type": "json_object"},
+                max_tokens=_EXTRACTION_RETRY_MAX_TOKENS,
+            )
+        except LLMResponseError as exc:
+            print(
+                f"  [extract] {doc_id}: пустой/обрезанный ответ LLM даже при "
+                f"max_tokens={_EXTRACTION_RETRY_MAX_TOKENS} ({exc}); документ останется без сущностей."
+            )
+            return DocExtraction(doc_id=doc_id)
 
     try:
         data = _parse_json(raw)
-    except (json.JSONDecodeError, AttributeError):
+    except (json.JSONDecodeError, AttributeError) as exc:
+        print(
+            f"  [extract] {doc_id}: не удалось распарсить JSON от LLM ({exc}); "
+            f"сырой ответ (первые 300 символов): {raw[:300]!r}"
+        )
         return DocExtraction(doc_id=doc_id)
 
     entities = [

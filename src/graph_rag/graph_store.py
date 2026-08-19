@@ -175,9 +175,15 @@ def load_graph(path: Path = GRAPH_PATH) -> nx.MultiDiGraph:
 # --- запросы по графу -------------------------------------------------------
 
 
-def resolve_entity(G: nx.MultiDiGraph, query: str, score_cutoff: int = 60) -> str | None:
+def resolve_entity(G: nx.MultiDiGraph, query: str, score_cutoff: int = 80) -> str | None:
     """Находит ключ узла по имени: сначала точное совпадение после нормализации,
-    иначе fuzzy-match по отображаемым именам (устойчиво к опечаткам/регистру/склонениям)."""
+    иначе fuzzy-match по отображаемым именам (устойчиво к опечаткам/регистру/склонениям).
+
+    `score_cutoff=80` — ниже (было 60) WRatio регулярно выдаёт случайное совпадение с
+    коротким/частым именем узла вместо честного "не найдено": на реальном графе
+    `resolve_entity("Barack Obama")` (сущности нет в графе) при cutoff=60 находил узел
+    вроде "GB"/"Burma" с score в районе 60 — то есть `neighbors "Barack Obama"` тихо
+    показывал окрестность совсем другого узла вместо явного сигнала "не найдено"."""
     key = _normalize(query)
     if key in G:
         return key

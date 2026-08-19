@@ -35,6 +35,10 @@ CLUSTERS_PATH = settings.artifacts_dir / "clusters.json"
 DOC_CLUSTERS_PATH = settings.artifacts_dir / "doc_clusters.parquet"
 
 N_REPRESENTATIVE_DOCS = 5
+# 30 токенов недостаточно даже с запасом — на "рассуждающей" модели (chain-of-thought
+# съедает лимит раньше, чем модель доходит до самого названия) это давало пустую строку,
+# на обычной модели могло обрезать середину названия.
+_LABEL_MAX_TOKENS = 80
 
 
 def l2_normalize(X: np.ndarray) -> np.ndarray:
@@ -88,7 +92,7 @@ def label_cluster(representative_titles: list[str]) -> str:
             "content": f"Заголовки представительных документов кластера:\n{bullet_list}",
         },
     ]
-    label = chat_complete(messages, temperature=0.0, max_tokens=30)
+    label = chat_complete(messages, temperature=0.0, max_tokens=_LABEL_MAX_TOKENS)
     return label.strip().strip('"').strip("'")
 
 
@@ -110,6 +114,11 @@ def build_clusters(force: bool = False) -> dict:
         rep_idx = _representative_doc_indices(X, labels, kmeans.cluster_centers_, cluster_id, N_REPRESENTATIVE_DOCS)
         rep_titles = docs.iloc[rep_idx]["title"].tolist()
         label = label_cluster(rep_titles)
+        if not label:
+            # Пустая метка молча в clusters.json не пишется — она бесполезна для UI/CLI
+            # и хуже честного "cluster_N": хотя бы понятно, что LLM-нейминг здесь не сработал.
+            print(f"  [cluster {cluster_id}] LLM вернула пустое название, использую фолбэк")
+            label = f"cluster_{cluster_id}"
         clusters[str(cluster_id)] = {
             "label": label,
             "size": int(len(member_idx)),

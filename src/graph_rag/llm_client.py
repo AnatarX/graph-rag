@@ -29,6 +29,16 @@ from graph_rag.config import settings
 _RETRYABLE = (APIConnectionError, RateLimitError, APIError)
 
 
+class LLMResponseError(RuntimeError):
+    """LLM вернул пустой или обрезанный по max_tokens ответ.
+
+    Не входит в `_RETRYABLE` — это не транспортная ошибка, повторный точно такой же
+    запрос с тем же max_tokens почти наверняка обрежется точно так же, поэтому решение
+    "что делать дальше" (например, повторить с большим max_tokens) оставляем вызывающему
+    коду, а не ретраим здесь вслепую. Важно: такой ответ никогда не должен попасть в
+    дисковый кэш (см. `chat_complete`) — иначе брак закрепится там навсегда."""
+
+
 def _extra_body() -> dict | None:
     if not settings.llm_extra_options:
         return None
@@ -158,7 +168,22 @@ def chat_complete(
     if extra_body:
         kwargs["extra_body"] = extra_body
     response = client.chat.completions.create(**kwargs)
-    content = response.choices[0].message.content or ""
+    choice = response.choices[0]
+    content = choice.message.content or ""
+    finish_reason = choice.finish_reason
+
+    # Проверяем ответ ДО записи в кэш: обрезанный (finish_reason == "length") или пустой
+    # контент — не валидный результат, и его нельзя закрепить в дисковом кэше навсегда
+    # (--force кэш не чистит, так что брак иначе переживёт даже принудительный перезапуск).
+    if finish_reason == "length":
+        raise LLMResponseError(
+            f"Ответ модели {model!r} обрезан по max_tokens={max_tokens} "
+            f"(finish_reason='length'). Увеличь max_tokens или сократи промпт."
+        )
+    if not content.strip():
+        raise LLMResponseError(
+            f"Модель {model!r} вернула пустой ответ (finish_reason={finish_reason!r})."
+        )
 
     if use_cache:
         _cache_set(key, payload, content)
