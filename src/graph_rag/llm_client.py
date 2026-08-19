@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -89,7 +90,14 @@ def get_access_token() -> str:
 # (LLM_KEY_ID/LLM_KEY_SECRET) get_access_token() сам возвращает новый токен ровно тогда,
 # когда старый истёк (раз в час, см. _token_cache) — клиент пересобирается синхронно с
 # этим, не чаще и не реже, так что долгоживущие батчи не сломаются после ротации токена.
+#
+# graph_extraction.build_extractions гоняет chat_complete из нескольких потоков
+# (ThreadPoolExecutor) — без блокировки первый параллельный вызов на пустом кэше может
+# дать несколько потоков, одновременно решивших, что клиента ещё нет, и каждый построит
+# свой (сам OpenAI() не делает I/O, так что порчи данных это не вызывает — просто
+# лишний неиспользуемый клиент). Лок убирает и это: конструирование клиента сериализуется.
 _client_cache: dict[str, object] = {}
+_client_cache_lock = threading.Lock()
 
 
 def get_client() -> OpenAI:
@@ -104,17 +112,19 @@ def get_client() -> OpenAI:
     Клиент кэшируется по api_key (см. `_client_cache`) — пересоздаётся только когда
     api_key поменялся, а не на каждый вызов, чтобы переиспользовать TCP/TLS-соединения
     (пул внутри httpx.Client) между запросами, а не открывать новое соединение на
-    каждый из сотен LLM-вызовов.
+    каждый из сотен LLM-вызовов. Вызывается из нескольких потоков параллельно (см.
+    `graph_extraction.build_extractions`), поэтому проверка+запись кэша — под локом.
     """
     api_key = settings.llm_api_key or get_access_token()
-    cached_key = _client_cache.get("api_key")
-    if cached_key == api_key:
-        return _client_cache["client"]  # type: ignore[return-value]
+    with _client_cache_lock:
+        cached_key = _client_cache.get("api_key")
+        if cached_key == api_key:
+            return _client_cache["client"]  # type: ignore[return-value]
 
-    client = OpenAI(api_key=api_key, base_url=settings.llm_base_url)
-    _client_cache["api_key"] = api_key
-    _client_cache["client"] = client
-    return client
+        client = OpenAI(api_key=api_key, base_url=settings.llm_base_url)
+        _client_cache["api_key"] = api_key
+        _client_cache["client"] = client
+        return client
 
 
 def _cache_key(kind: str, payload: dict) -> str:

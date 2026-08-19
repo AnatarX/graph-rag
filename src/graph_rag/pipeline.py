@@ -11,13 +11,16 @@ ingest -> embeddings -> clustering -> graph_extraction -> graph_store
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
+
 import typer
 
 from graph_rag.clustering import CLUSTERS_PATH, build_clusters
 from graph_rag.config import settings
 from graph_rag.embeddings import EMBEDDINGS_PATH, build_embeddings
 from graph_rag.graph_extraction import EXTRACTIONS_PATH, build_extractions
-from graph_rag.graph_store import GRAPH_PATH, attach_clusters, build_graph, save_graph
+from graph_rag.graph_store import GRAPH_PATH, attach_clusters, build_graph, load_graph, save_graph
 from graph_rag.ingest import load_corpus, load_saved_corpus, save_corpus
 
 app = typer.Typer(add_completion=False)
@@ -57,8 +60,6 @@ def build(force: bool = typer.Option(False, "--force", help="Пересчита�
 
     if force or not GRAPH_PATH.exists():
         typer.echo("[5/5] graph_store: собираю граф...")
-        import json
-
         extractions = json.loads(EXTRACTIONS_PATH.read_text(encoding="utf-8"))
         G = build_graph(extractions)
 
@@ -68,26 +69,27 @@ def build(force: bool = typer.Option(False, "--force", help="Пересчита�
         attach_clusters(G, doc_clusters)
         save_graph(G)
         typer.echo(f"      {G.number_of_nodes()} узлов, {G.number_of_edges()} рёбер")
-
-        # Числа узлов/рёбер зависят от модели, которая извлекала граф (см. README,
-        # раздел "Срезанные углы") — без привязки к модели и дате прогона они
-        # невоспроизводимы и бесполезны для проверки. Фиксируем это здесь же, а не
-        # печатаем только в консоль.
-        from datetime import datetime, timezone
-
-        run_metadata = {
-            "built_at": datetime.now(timezone.utc).isoformat(),
-            "chat_model": settings.llm_chat_model,
-            "embed_model": settings.llm_embed_model,
-            "n_docs": len(docs),
-            "graph_nodes": G.number_of_nodes(),
-            "graph_edges": G.number_of_edges(),
-        }
-        metadata_path = settings.artifacts_dir / "run_metadata.json"
-        metadata_path.write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-        typer.echo(f"      метаданные прогона -> {metadata_path}")
     else:
         typer.echo("[5/5] graph_store: уже есть, пропускаю")
+        G = load_graph()
+
+    # Числа узлов/рёбер зависят от модели, которая извлекала граф (см. README,
+    # раздел "Срезанные углы") — без привязки к модели и дате прогона они
+    # невоспроизводимы и бесполезны для проверки. Пишем метаданные ВСЕГДА (а не
+    # только в ветке свежей сборки) — иначе для graph.json, уже лежавшего на диске
+    # до появления этого файла (или собранного через skip-ветку), run_metadata.json
+    # никогда бы не появился без --force.
+    run_metadata = {
+        "built_at": datetime.now(timezone.utc).isoformat(),
+        "chat_model": settings.llm_chat_model,
+        "embed_model": settings.llm_embed_model,
+        "n_docs": len(docs),
+        "graph_nodes": G.number_of_nodes(),
+        "graph_edges": G.number_of_edges(),
+    }
+    metadata_path = settings.artifacts_dir / "run_metadata.json"
+    metadata_path.write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"      метаданные прогона -> {metadata_path}")
 
     typer.echo("Готово. Дальше: `uv run streamlit run app/streamlit_app.py`")
 
