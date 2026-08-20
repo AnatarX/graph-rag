@@ -9,11 +9,25 @@ doc_id, где эта связь была упомянута.
 имени, но не разные формы одного человека в разных документах: LLM извлекает сущность
 в том написании, что стоит в конкретном тексте (см. graph_extraction.py), поэтому одна
 статья даёт "Tony Blair", а другая — просто "Blair". Без доп. резолюции это были бы два
-разных узла графа. `_resolve_node_key` схлопывает такие случаи по правилу "общая
-фамилия/последний токен + один набор токенов вложен в другой" (см. `_is_alias_of`) —
-токенная эвристика, а не embedding-based entity resolution: осознанное упрощение для
-100 документов, дешёвое и достаточно точное на этом масштабе. На большом и шумном
-датасете это первое, что перестанет работать (см. README, раздел про масштаб).
+разных узла графа.
+
+Резолюция имён — ДВУХУРОВНЕВАЯ:
+
+1. Токенная эвристика (`_resolve_node_key`/`_is_alias_of`) — общая фамилия/последний
+   токен + один набор токенов вложен в другой. Бесплатная (никаких LLM/embedding-вызовов),
+   быстрая, срабатывает первой. Ловит "Blair"/"Tony Blair", но ничего не может со случаями
+   без общего токена: "Russia"/"Russian Federation"/"RF", "US"/"United States", "UN"/"United
+   Nations" — то есть именно там, где нужна семантика, а не подстрока.
+2. Если токенная эвристика не нашла существующий узел, `build_graph` (при
+   `resolve_semantically=True`) прогоняет имя через embedding+FAISS+LLM резолюцию
+   (`entity_resolution.py`): эмбеддинг имени ищется в FAISS-индексе имён уже известных
+   узлов, top-k кандидатов выше порога похожести обогащаются алиасами и фактами и
+   передаются LLM на суд — та же ли это сущность или нет. Это fallback ИМЕННО для случаев
+   без общего токена; он дороже (embedding + иногда LLM-вызов на новую сущность), поэтому
+   и идёт вторым шагом, а не заменяет токенную эвристику.
+
+`_resolve_node_key` сама по себе не знает про семантический шаг — интеграция на уровне
+`build_graph`, где эта функция вызывается (см. `_resolve_key_with_fallback` ниже).
 """
 
 from __future__ import annotations
@@ -28,6 +42,7 @@ import typer
 from rapidfuzz import fuzz, process
 
 from graph_rag.config import settings
+from graph_rag.entity_resolution import EntityIndex, add_to_index, create_index, resolve_entity_semantically
 from graph_rag.graph_extraction import is_valid_entity_name
 
 GRAPH_PATH = settings.artifacts_dir / "graph.json"
@@ -69,14 +84,47 @@ def _resolve_node_key(G: nx.MultiDiGraph, name: str, entity_type: str) -> str:
     return key
 
 
-def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
+def _resolve_key_with_fallback(
+    G: nx.MultiDiGraph,
+    entity_index: EntityIndex | None,
+    name: str,
+    entity_type: str,
+    resolve_semantically: bool,
+) -> str:
+    """Ключ узла для `name`: сначала токенная эвристика (`_resolve_node_key`); если она
+    НЕ нашла существующий узел (значит собирается вернуть новый ключ, которого ещё нет
+    в `G`) и `resolve_semantically=True` — embedding+FAISS+LLM резолюция как fallback
+    (см. `entity_resolution.resolve_entity_semantically`) ловит случаи без общего токена
+    ("Russia"/"Russian Federation"). Возвращённый ключ либо уже есть в `G`, либо
+    гарантированно новый — создание узла остаётся на вызывающем коде (`build_graph`),
+    эта функция графа не мутирует."""
+    key = _resolve_node_key(G, name, entity_type)
+    if not key or key in G or not resolve_semantically:
+        return key
+    semantic_key = resolve_entity_semantically(G, entity_index, name, entity_type)
+    return semantic_key if semantic_key is not None else key
+
+
+def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> nx.MultiDiGraph:
     """Собирает граф из LLM-экстракций. Записи, где subject/object/entity — не короткое
     имя сущности, а целая фраза/предложение (LLM это иногда делает, вопреки промпту —
     см. `graph_extraction.is_valid_entity_name`), отбрасываются здесь же: это дешёвая
     защита, которая чистит и уже закэшированные extractions.json задним числом, без
     повторного вызова LLM (сам extract_from_text тоже фильтрует на входе — для новых
-    вызовов, — но старые кэшированные данные написаны до этого фильтра)."""
+    вызовов, — но старые кэшированные данные написаны до этого фильтра).
+
+    `resolve_semantically` (по умолчанию `True`) включает второй, embedding+FAISS+LLM
+    проход резолюции имён поверх токенной эвристики (см. докстринг модуля выше) —
+    единственный способ схлопнуть синонимы без общего токена вроде "US"/"United States"
+    или "Russia"/"Russian Federation". Внутри вызова заводится локальный FAISS-индекс
+    (`entity_index`), живущий только на время сборки этого графа — не персистится
+    отдельно, потому что граф и так пересобирается из extractions.json на каждый прогон
+    `pipeline build --force`, отдельный кэш индекса был бы лишней сложностью. При
+    `resolve_semantically=False` индекс вообще не создаётся (в частности, не делает ни
+    одного embedding-вызова) — используется офлайн-тестами токенной эвристики и любым
+    вызывающим кодом, которому семантический шаг не нужен."""
     G = nx.MultiDiGraph()
+    entity_index = create_index() if resolve_semantically else None
     name_counts: dict[str, Counter] = {}
     # Тип узла — голосование большинством среди всех НЕ-"other" типов, с которыми
     # сущность встретилась (по всем документам), а не тип первого попавшегося
@@ -93,12 +141,20 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
             if not is_valid_entity_name(entity["name"]):
                 continue
             etype = entity.get("type", "other")
-            key = _resolve_node_key(G, entity["name"], etype)
+            key = _resolve_key_with_fallback(G, entity_index, entity["name"], etype, resolve_semantically)
             if not key:
                 continue
             if key not in G:
-                G.add_node(key, type="other", doc_ids=set(), aliases=set())
+                # `name` здесь — только placeholder (первое встреченное написание), сразу
+                # нужный: если resolve_semantically=True, следующая сущность в этом же
+                # прогоне может найти этот узел кандидатом (`_describe_candidate` в
+                # entity_resolution.py читает `data["name"]`) ещё ДО финального
+                # голосования по name_counts ниже в этой функции, которое его перезапишет
+                # на самый частый вариант написания.
+                G.add_node(key, name=entity["name"], type="other", doc_ids=set(), aliases=set())
                 name_counts[key] = Counter()
+                if resolve_semantically:
+                    add_to_index(entity_index, key, entity["name"])
             G.nodes[key]["doc_ids"].add(doc_id)
             G.nodes[key]["aliases"].add(entity["name"])
             name_counts[key][entity["name"]] += 1
@@ -108,15 +164,18 @@ def build_graph(extractions: list[dict]) -> nx.MultiDiGraph:
         for relation in doc["relations"]:
             if not is_valid_entity_name(relation["subject"]) or not is_valid_entity_name(relation["object"]):
                 continue
-            skey = _resolve_node_key(G, relation["subject"], "other")
-            okey = _resolve_node_key(G, relation["object"], "other")
+            skey = _resolve_key_with_fallback(G, entity_index, relation["subject"], "other", resolve_semantically)
+            okey = _resolve_key_with_fallback(G, entity_index, relation["object"], "other", resolve_semantically)
             predicate = relation["predicate"]
             if not skey or not okey:
                 continue
             for key, raw_name in ((skey, relation["subject"]), (okey, relation["object"])):
                 if key not in G:
-                    G.add_node(key, type="other", doc_ids=set(), aliases=set())
+                    # Placeholder-name сразу при создании — см. комментарий в цикле entities выше.
+                    G.add_node(key, name=raw_name, type="other", doc_ids=set(), aliases=set())
                     name_counts[key] = Counter()
+                    if resolve_semantically:
+                        add_to_index(entity_index, key, raw_name)
                 G.nodes[key]["doc_ids"].add(doc_id)
                 G.nodes[key]["aliases"].add(raw_name)
                 name_counts[key][raw_name] += 1

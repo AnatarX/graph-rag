@@ -21,6 +21,7 @@ dependencies = [
     "kagglehub>=0.3",
     "typer>=0.12",
     "pyvis>=0.3.2",
+    "faiss-cpu>=1.9",
 ]
 
 [dependency-groups]
