@@ -135,7 +135,14 @@ def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> n
     # единственная причина, по которой узел может остаться "other" в итоге.
     type_counts: dict[str, Counter] = {}
 
-    for doc in extractions:
+    total_docs = len(extractions)
+    for doc_num, doc in enumerate(extractions, start=1):
+        if resolve_semantically:
+            # Семантическая резолюция — самый долгий шаг всей сборки (embedding, а иногда
+            # и LLM-вызов на каждую новую сущность): на локальной модели это десятки минут.
+            # Без этой строки шаг не печатает ни байта до самого конца и неотличим от
+            # зависшего процесса.
+            print(f"  [{doc_num}/{total_docs}] резолвлю сущности: {doc['doc_id']}", flush=True)
         doc_id = doc["doc_id"]
         for entity in doc["entities"]:
             if not is_valid_entity_name(entity["name"]):

@@ -75,11 +75,12 @@ def _render_sources(sources: dict) -> None:
 
     facts = sources.get("graph_facts") or []
     if facts:
+        # Здесь уже ровно те факты, что ушли в промпт LLM — отранжированные и обрезанные
+        # в rag.rank_facts_for_prompt. Своей обрезки тут быть не должно: иначе пользователь
+        # видел бы под ответом одни "источники", а модель отвечала бы по другим.
         st.markdown("**Факты из графа знаний:**")
-        for f in facts[:15]:
+        for f in facts:
             st.markdown(f"- {f['subject']} → *{f['predicate']}* → {f['object']}")
-        if len(facts) > 15:
-            st.caption(f"...и ещё {len(facts) - 15}")
 
     if not (entities or docs or facts):
         st.caption("Источники не найдены — ответ, скорее всего, вне датасета.")

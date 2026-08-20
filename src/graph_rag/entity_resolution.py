@@ -50,34 +50,84 @@ from graph_rag.llm_client import chat_complete, embed_texts
 SIMILARITY_THRESHOLD = 0.55
 TOP_K_CANDIDATES = 5
 
+# Порог "похожести достаточно, чтобы спрашивать LLM без поверхностных улик" — см.
+# `_worth_asking_llm`. Настоящие синонимы без общих букв ("britain"/"uk") живут выше него.
+HIGH_SIMILARITY = 0.80
+
 # Кандидату хватает пары фактов, чтобы LLM могла понять контекст, не раздувая промпт.
 _MAX_FACTS_PER_CANDIDATE = 4
 _JUDGE_MAX_TOKENS = 80
+
+# Служебные слова, которые не дают буквы в аббревиатуру: IAAF — это International
+# Association *of* Athletics Federations, "of" в акроним не попадает.
+_ACRONYM_STOPWORDS = frozenset({"of", "the", "and", "for", "a", "an", "de", "in", "on"})
 
 
 @dataclass
 class EntityIndex:
     """Инкрементальный FAISS-индекс имён узлов графа: `index` хранит только векторы
     (L2-нормализованные, cosine similarity через inner product), `keys[i]` — ключ узла
-    графа, отвечающий вектору на позиции `i` (FAISS сам метаданные не хранит)."""
+    графа, отвечающий вектору на позиции `i`, `names[i]` — имя, которым этот узел был
+    проиндексирован (FAISS сам метаданные не хранит, а имя нужно blocking-фильтру в
+    `_worth_asking_llm`, чтобы не тащить в него весь граф)."""
 
     index: faiss.IndexFlatIP
     keys: list[str] = field(default_factory=list)
+    names: list[str] = field(default_factory=list)
+
+
+# Ставится в True после первого же отказа провайдера: без него каждая из сотен сущностей
+# заново ждала бы таймаут и ретраи tenacity, растягивая "быстрое падение" на часы.
+# Сбрасывается в `create_index`, то есть живёт ровно одну сборку графа, а не весь процесс.
+_embedding_failed = False
 
 
 def create_index() -> EntityIndex:
     """Пустой FAISS-индекс нужной размерности. Размерность берётся реальным вызовом
     `embed_texts`, а не хардкодится — она зависит от настроенной embedding-модели
-    (для bge-m3 сейчас 1024, но это не должно быть magic-числом в коде)."""
-    dim = embed_texts(["dimension probe"])[0].shape[0]
-    return EntityIndex(index=faiss.IndexFlatIP(int(dim)))
+    (для bge-m3 сейчас 1024, но это не должно быть magic-числом в коде). Если провайдер
+    недоступен — индекс остаётся нулевой размерности и в него ничего не добавится, то есть
+    резолюция мягко выродится в токенную эвристику (см. `_embed_name`)."""
+    global _embedding_failed
+    # Каждая сборка графа начинает с чистого листа: если прошлая упала из-за лежащего
+    # провайдера, это не должно молча отключать резолюцию в следующей (в том же процессе).
+    _embedding_failed = False
+    probe = _embed_name("dimension probe")
+    dim = int(probe.shape[1]) if probe is not None else 1
+    return EntityIndex(index=faiss.IndexFlatIP(dim))
+
+
+def _embed_name(name: str) -> np.ndarray | None:
+    """L2-нормализованный вектор имени, либо `None`, если embedding-провайдер недоступен.
+
+    Семантическая резолюция — улучшение поверх токенной эвристики, а не обязательный шаг:
+    если LLM-провайдер лежит (или у ревьюера он вообще не сконфигурирован), сборка графа
+    должна деградировать до токенной эвристики с предупреждением, а не падать трейсбеком
+    на последнем шаге пайплайна, потеряв всю проделанную работу. Ровно так же ведёт себя
+    и LLM-суд (см. `judge_candidates`)."""
+    global _embedding_failed
+    if _embedding_failed:
+        return None
+    try:
+        return l2_normalize(embed_texts([name]).astype(np.float32))
+    except Exception as exc:  # noqa: BLE001 — любая ошибка провайдера, не только сетевая
+        _embedding_failed = True
+        print(
+            f"  [entity_resolution] эмбеддинги недоступны ({exc}); семантическая резолюция "
+            "сущностей отключена до конца прогона, остаётся только токенная эвристика."
+        )
+        return None
 
 
 def add_to_index(entity_index: EntityIndex, key: str, name: str) -> None:
-    """Эмбеддит `name` и добавляет вектор в индекс, привязывая его к ключу узла `key`."""
-    vector = l2_normalize(embed_texts([name]).astype(np.float32))
+    """Эмбеддит `name` и добавляет вектор в индекс, привязывая его к ключу узла `key`.
+    Если эмбеддинги недоступны — тихо пропускает (см. `_embed_name`)."""
+    vector = _embed_name(name)
+    if vector is None:
+        return
     entity_index.index.add(vector)
     entity_index.keys.append(key)
+    entity_index.names.append(name)
 
 
 def find_candidates(
@@ -88,19 +138,75 @@ def find_candidates(
     threshold: float = SIMILARITY_THRESHOLD,
 ) -> list[str]:
     """Ключи узлов-кандидатов: топ-k ближайших соседей `name` в индексе по косинусному
-    сходству, отфильтрованные по `threshold`. Никаких обращений к LLM здесь — чисто
-    векторный поиск, LLM-суд — отдельный шаг (`judge_candidate`/`resolve_entity_semantically`)."""
+    сходству, отфильтрованные по `threshold` и по blocking-правилу `_worth_asking_llm`
+    (оно отсеивает пары, на которых LLM заведомо нечего решать — см. его докстринг).
+    Никаких обращений к LLM здесь — чисто векторный поиск, LLM-суд — отдельный шаг
+    (`judge_candidates`/`resolve_entity_semantically`)."""
     if entity_index.index.ntotal == 0:
         return []
-    vector = l2_normalize(embed_texts([name]).astype(np.float32))
+    vector = _embed_name(name)
+    if vector is None:
+        return []
     k = min(top_k, entity_index.index.ntotal)
     scores, indices = entity_index.index.search(vector, k)
     candidates = []
     for score, idx in zip(scores[0], indices[0]):
         if idx == -1 or score < threshold:
             continue
+        if not _worth_asking_llm(name, entity_index.names[idx], float(score)):
+            continue
         candidates.append(entity_index.keys[idx])
     return candidates
+
+
+def _name_tokens(name: str) -> list[str]:
+    """Токены имени без обрамляющей пунктуации: "(BNP)" -> "bnp", "Barstow," -> "barstow"."""
+    stripped = (t.strip("()[].,:;\"'").casefold() for t in name.split())
+    return [t for t in stripped if t]
+
+
+def _acronym_of(tokens: list[str]) -> str:
+    return "".join(t[0] for t in tokens if t and t not in _ACRONYM_STOPWORDS)
+
+
+def has_surface_evidence(a: str, b: str) -> bool:
+    """Есть ли у двух имён поверхностная улика, что это формы ОДНОГО имени:
+    вложенность токенов ("amnesty" в "amnesty international", "bnp" в "british national
+    party (bnp)") либо аббревиатура ("iaaf" = International Association of Athletics
+    Federations, "eu" = European Union).
+
+    Аббревиатуру признаём только у многословного имени: иначе односложное "3" сошло бы
+    за аббревиатуру "3ami" (реальный ложный случай с этого корпуса)."""
+    a_tokens, b_tokens = _name_tokens(a), _name_tokens(b)
+    if not a_tokens or not b_tokens:
+        return False
+    if set(a_tokens) <= set(b_tokens) or set(b_tokens) <= set(a_tokens):
+        return True
+    for short, long_form in ((a_tokens, b_tokens), (b_tokens, a_tokens)):
+        if len(short) == 1 and len(long_form) >= 2 and short[0] == _acronym_of(long_form):
+            return True
+    return False
+
+
+def _worth_asking_llm(name: str, candidate_name: str, score: float) -> bool:
+    """Стоит ли тратить LLM-вызов на пару "новая сущность / кандидат".
+
+    Это blocking-шаг, стандартный для entity resolution: дешёвый фильтр перед дорогим
+    сравнением. Нужен по двум причинам, обе подтверждены замерами на этом корпусе:
+
+    1. Точность. В зоне похожести 0.55-0.80 у маленькой локальной модели нет ни одной
+       зацепки, кроме самих имён, и она начинает угадывать: на прогоне без этого фильтра
+       она слила футболиста "cisse" с "nicolas cage" (0.559), "ebell" с "ebay" (0.666),
+       "bill" с "bush" (0.714) — то самое ложное слияние, которое портит граф сильнее,
+       чем недомерж. С фильтром 10 из 13 таких ложных слияний не доходят до LLM вообще.
+    2. Цена. Без фильтра LLM-суд звался 704 раза на 100 документов и занимал часы на
+       локальной модели — больше, чем вся остальная сборка графа вместе взятая.
+
+    Пропускаем пару, если есть поверхностная улика (см. `has_surface_evidence`) ЛИБО
+    похожесть настолько высока, что улики не нужны: "britain"/"uk" (0.837) и
+    "tories"/"conservatives" — настоящие синонимы без единой общей буквы, и первый из них
+    проходит именно по этому правилу. Второй — цена фильтра, см. README."""
+    return score >= HIGH_SIMILARITY or has_surface_evidence(name, candidate_name)
 
 
 def _candidate_facts(G: nx.MultiDiGraph, key: str, limit: int = _MAX_FACTS_PER_CANDIDATE) -> list[str]:
@@ -123,7 +229,7 @@ def _describe_candidate(G: nx.MultiDiGraph, key: str) -> dict:
     data = G.nodes[key]
     return {
         "key": key,
-        "name": data["name"],
+        "name": data.get("name", key),
         "type": data.get("type", "other"),
         "aliases": sorted(data.get("aliases", set())),
         "facts": _candidate_facts(G, key),

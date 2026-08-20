@@ -103,10 +103,23 @@ def status() -> None:
         "doc_clusters.parquet": DOC_CLUSTERS_PATH,
         "extractions.json": EXTRACTIONS_PATH,
         "graph.json": GRAPH_PATH,
+        "run_metadata.json": settings.artifacts_dir / "run_metadata.json",
     }
     for name, path in artifacts.items():
         mark = "✓" if path.exists() else "·"
         typer.echo(f"{mark} {name}")
+
+    # run_metadata.json — единственный источник правды по числам графа (README ссылается
+    # на него вместо захардкоженных цифр), поэтому показываем содержимое здесь же.
+    metadata_path = artifacts["run_metadata.json"]
+    if metadata_path.exists():
+        meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+        typer.echo(
+            f"  последний прогон: {meta['built_at']}\n"
+            f"  модели: chat={meta['chat_model']}, embed={meta['embed_model']}\n"
+            f"  {meta['n_docs']} документов -> граф {meta['graph_nodes']} узлов / "
+            f"{meta['graph_edges']} рёбер"
+        )
 
 
 if __name__ == "__main__":

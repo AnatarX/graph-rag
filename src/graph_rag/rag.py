@@ -169,14 +169,12 @@ def _truncate_at_sentence(text: str, limit: int) -> str:
 
 def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -> RetrievalResult:
     docs = _cached(DOCS_PATH, load_saved_corpus)
-    embeddings = _cached(EMBEDDINGS_PATH, load_embeddings)
+    # Нормализуем эмбеддинги документов ОДИН раз на файл, а не на каждый вопрос:
+    # `_cached` инвалидируется по mtime, так что пересборка артефактов подхватится, а
+    # повторные вопросы в чате переиспользуют уже готовую матрицу. Сама нормализация —
+    # l2_normalize из clustering.py, чтобы не дублировать подсчёт норм (см. ревью, п.12).
+    doc_unit = _cached(EMBEDDINGS_PATH, lambda: l2_normalize(load_embeddings()))
     query_vec = embed_texts([query])[0]
-
-    # Переиспользуем l2_normalize из clustering.py вместо дублирования подсчёта норм —
-    # эмбеддинги документов нормализуются на каждый запрос заново (нормализация дешёвая
-    # относительно самого эмбеддинг-вызова), а не заранее и не кэшируются между вызовами:
-    # мемоизация — отдельная задача.
-    doc_unit = l2_normalize(embeddings)
     query_unit = l2_normalize(query_vec.reshape(1, -1))[0]
     sims = doc_unit @ query_unit
 
@@ -210,6 +208,29 @@ def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -
     return RetrievalResult(vector_hits=vector_hits, graph_facts=graph_facts, matched_entities=matched_entities)
 
 
+def rank_facts_for_prompt(facts: list[GraphFact]) -> list[GraphFact]:
+    """Дедуплицирует факты и оставляет `MAX_GRAPH_FACTS_IN_PROMPT` самых значимых.
+
+    Для хабов (например, "Gordon Brown": 24 факта на 1 хопе, 49 на двух) без ранжирования
+    и лимита все факты уезжают в промпт как равнозначные. Значимость меряем числом
+    источников (`len(doc_ids)`): подтверждённое несколькими документами важнее единичного
+    упоминания. Сортировка стабильна, так что при равном числе источников сохраняется
+    порядок обнаружения.
+
+    Публичная (не `_`-приватная) намеренно: `answer()` возвращает ровно этот же список в
+    `graph_facts`, чтобы UI показывал пользователю те факты, что реально ушли в промпт
+    LLM, а не другой их срез."""
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[GraphFact] = []
+    for fact in facts:
+        signature = (fact.subject, fact.predicate, fact.object)
+        if signature not in seen:
+            seen.add(signature)
+            unique.append(fact)
+    unique.sort(key=lambda fact: len(fact.doc_ids), reverse=True)
+    return unique[:MAX_GRAPH_FACTS_IN_PROMPT]
+
+
 def _build_context_block(retrieval: RetrievalResult) -> str:
     parts = []
 
@@ -220,23 +241,11 @@ def _build_context_block(retrieval: RetrievalResult) -> str:
 
     if retrieval.graph_facts:
         parts.append("\n## Факты из графа знаний")
-        seen = set()
-        unique_facts: list[tuple[GraphFact, str]] = []
-        for fact in retrieval.graph_facts:
-            line = f"{fact.subject} --{fact.predicate}--> {fact.object} (источники: {', '.join(fact.doc_ids)})"
-            if line not in seen:
-                seen.add(line)
-                unique_facts.append((fact, line))
-
-        # Для хабов (например, "Gordon Brown": 24 факта на 1 хопе, 49 на двух) без
-        # ранжирования и лимита все факты уезжают в промпт как равнозначные. Ранжируем
-        # по числу источников (len(doc_ids)) как прокси значимости факта — то, что
-        # подтверждено несколькими документами, важнее единичного упоминания — и
-        # обрезаем по MAX_GRAPH_FACTS_IN_PROMPT (сортировка стабильна, так что при
-        # равном числе источников порядок совпадает с порядком обнаружения фактов).
-        unique_facts.sort(key=lambda pair: len(pair[0].doc_ids), reverse=True)
-        for _, line in unique_facts[:MAX_GRAPH_FACTS_IN_PROMPT]:
-            parts.append(line)
+        for fact in rank_facts_for_prompt(retrieval.graph_facts):
+            parts.append(
+                f"{fact.subject} --{fact.predicate}--> {fact.object} "
+                f"(источники: {', '.join(fact.doc_ids)})"
+            )
 
     return "\n\n".join(parts)
 
@@ -288,9 +297,12 @@ def answer(
         "documents": [
             {"doc_id": h.doc_id, "title": h.title, "score": h.score} for h in retrieval.vector_hits
         ],
+        # Ровно тот же срез фактов, что ушёл в промпт (см. `rank_facts_for_prompt`):
+        # иначе UI показывал бы пользователю одни факты как "источники ответа", а модель
+        # отвечала бы по другим.
         "graph_facts": [
             {"subject": f.subject, "predicate": f.predicate, "object": f.object, "doc_ids": f.doc_ids}
-            for f in retrieval.graph_facts
+            for f in rank_facts_for_prompt(retrieval.graph_facts)
         ],
     }
 

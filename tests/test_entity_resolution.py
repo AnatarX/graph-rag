@@ -60,7 +60,7 @@ def _un_graph() -> nx.MultiDiGraph:
 def _index_with_un_candidate() -> EntityIndex:
     index = faiss.IndexFlatIP(DIM)
     index.add(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32))
-    return EntityIndex(index=index, keys=["united nations"])
+    return EntityIndex(index=index, keys=["united nations"], names=["United Nations"])
 
 
 # (а) кандидат находится и подтверждается LLM -> резолюция возвращает его ключ
@@ -175,3 +175,75 @@ def test_build_graph_merges_entity_without_shared_token_via_semantic_resolution(
     assert node["doc_ids"] == {"d1", "d2"}
     assert {"Russia", "Russian Federation"} <= node["aliases"]
     assert len(fake_chat.calls) == 1  # ровно один суд, на вторую (новую) сущность
+
+
+# --- blocking-фильтр перед LLM (has_surface_evidence / _worth_asking_llm) -------------
+# Все примеры ниже — реальные пары с прогона по корпусу BBC News: и удачные слияния,
+# которые фильтр обязан пропустить, и ложные, которые он обязан остановить до LLM.
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        # вложенность токенов
+        ("amnesty international", "amnesty"),
+        ("circuit city stores", "circuit city"),
+        ("barstow, california", "barstow"),
+        ("lee bowyer (red card)", "lee bowyer"),
+        ("british national party (bnp)", "bnp"),
+        # аббревиатура (служебные слова в акроним не входят)
+        ("international association of athletics federations", "iaaf"),
+        ("european union", "eu"),
+        ("court of arbitration for sport", "cas"),
+    ],
+)
+def test_surface_evidence_recognises_name_variants(a, b):
+    assert er.has_surface_evidence(a, b)
+    assert er.has_surface_evidence(b, a)  # симметрично
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("cisse", "cage"),
+        ("ebell", "ebay"),
+        ("bill", "bush"),
+        ("anfield", "liverpool"),
+        ("mobile gig", "mobile phones"),
+        # односложное имя не считается аббревиатурой другого односложного:
+        # иначе "3" сошло бы за акроним "3ami" (реальный ложный случай с корпуса)
+        ("3", "3ami"),
+    ],
+)
+def test_surface_evidence_rejects_unrelated_names(a, b):
+    assert not er.has_surface_evidence(a, b)
+    assert not er.has_surface_evidence(b, a)
+
+
+def test_low_similarity_without_evidence_does_not_reach_llm():
+    # 0.559 — реальная похожесть пары "cisse"/"cage", на которой LLM ошибалась
+    assert not er._worth_asking_llm("cisse", "cage", 0.559)
+
+
+def test_high_similarity_reaches_llm_even_without_surface_evidence():
+    # "britain"/"uk" — настоящие синонимы без единой общей буквы, 0.837 на реальных данных
+    assert er._worth_asking_llm("britain", "uk", 0.837)
+
+
+def test_low_similarity_with_surface_evidence_reaches_llm():
+    # 0.628 — реальная похожесть пары, которую спасает именно вложенность токенов
+    assert er._worth_asking_llm("british national party (bnp)", "bnp", 0.628)
+
+
+def test_find_candidates_blocks_implausible_pair_before_llm(monkeypatch):
+    """Кандидат выше порога похожести, но без улик и ниже HIGH_SIMILARITY —
+    `find_candidates` не должен его вернуть, то есть LLM не позовут вообще."""
+    index = faiss.IndexFlatIP(DIM)
+    index.add(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32))
+    entity_index = EntityIndex(index=index, keys=["cage"], names=["cage"])
+
+    # ~0.6 похожести: выше SIMILARITY_THRESHOLD (0.55), ниже HIGH_SIMILARITY (0.80)
+    fake_embed = _fake_embed_texts({"cisse": [0.6, 0.8, 0.0, 0.0]})
+    monkeypatch.setattr(er, "embed_texts", fake_embed)
+
+    assert er.find_candidates(entity_index, "cisse") == []
