@@ -42,6 +42,20 @@ class LLMResponseError(RuntimeError):
 
 
 def _extra_body() -> dict | None:
+    """Провайдер-специфичные параметры (`LLM_EXTRA_OPTIONS`) как `extra_body` запроса.
+
+    ВНИМАНИЕ, проверено экспериментально: OpenAI-совместимый эндпоинт Ollama
+    (`/v1/chat/completions`) молча ИГНОРИРУЕТ поле `options` — запрос с
+    `{"options": {"num_predict": 5}}` спокойно генерирует 81 токен. То есть на Ollama
+    через этот эндпоинт не применяются ни `num_ctx`, ни `num_thread`, ни `repeat_penalty`.
+    Ollama поддерживает только стандартные OpenAI-параметры; её собственные опции
+    задаются либо в Modelfile (`ollama create my-model -f Modelfile` с `PARAMETER
+    num_ctx 3072`), либо переменными окружения самого сервера Ollama — но не в запросе.
+
+    Поэтому защита от зацикливания маленьких моделей на temperature=0 живёт не здесь, а в
+    стандартном `frequency_penalty` (см. `LLM_FREQUENCY_PENALTY` в config) — он
+    поддерживается и Ollama, и облачными провайдерами. `LLM_EXTRA_OPTIONS` оставлен для
+    провайдеров, которые реально читают `extra_body` (например cloud.ru)."""
     if not settings.llm_extra_options:
         return None
     return {"options": json.loads(settings.llm_extra_options)}
@@ -227,6 +241,11 @@ def chat_complete(
         payload["response_format"] = response_format
     if max_tokens:
         payload["max_tokens"] = max_tokens
+    # Стандартный OpenAI-параметр, работает и на Ollama, и на облачных провайдерах
+    # (в отличие от provider-specific опций из `_extra_body`). В payload — значит
+    # участвует в ключе кэша: ответы с разным штрафом не должны путаться.
+    if settings.llm_frequency_penalty:
+        payload["frequency_penalty"] = settings.llm_frequency_penalty
 
     key = _cache_key("chat", payload)
     if use_cache:
@@ -240,6 +259,8 @@ def chat_complete(
         kwargs["response_format"] = response_format
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
+    if settings.llm_frequency_penalty:
+        kwargs["frequency_penalty"] = settings.llm_frequency_penalty
     extra_body = _extra_body()
     if extra_body:
         kwargs["extra_body"] = extra_body

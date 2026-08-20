@@ -1,19 +1,40 @@
 """Тесты на офлайн-часть rag.py: fuzzy-матчинг сущностей запроса по графу
-(`_find_query_entities`), сборку контекстного блока для промпта (`_build_context_block`)
-и обрезку сниппетов по границе предложения (`_truncate_at_sentence`). Ничего из этого
-не трогает сеть/LLM API — retrieve()/answer() здесь не вызываются."""
+(`_find_query_entities`), сборку контекстного блока для промпта (`_build_context_block`),
+обрезку сниппетов по границе предложения (`_truncate_at_sentence`) и выбор длины сниппета
+по профилю корпуса (`snippet_chars`). Ничего из этого не трогает сеть/LLM API —
+retrieve()/answer() здесь не вызываются."""
 
 import networkx as nx
 
 from graph_rag.rag import (
     MAX_GRAPH_FACTS_IN_PROMPT,
+    MAX_SNIPPET_CHARS,
+    MIN_SNIPPET_CHARS,
+    SNIPPET_CHARS,
     GraphFact,
     RetrievalResult,
     VectorHit,
     _build_context_block,
     _find_query_entities,
     _truncate_at_sentence,
+    snippet_chars,
 )
+
+
+def test_snippet_chars_uses_corpus_median():
+    assert snippet_chars({"median_doc_chars": 1500}) == 1500
+
+
+def test_snippet_chars_clamps_extremes():
+    # Слишком короткий сниппет режет документ до огрызка, слишком длинный — раздувает промпт.
+    assert snippet_chars({"median_doc_chars": 50}) == MIN_SNIPPET_CHARS
+    assert snippet_chars({"median_doc_chars": 100_000}) == MAX_SNIPPET_CHARS
+
+
+def test_snippet_chars_falls_back_without_profile():
+    # Профиля нет (старые артефакты) — работаем по прежней константе.
+    assert snippet_chars({"median_doc_chars": None}) == SNIPPET_CHARS
+    assert snippet_chars({}) == SNIPPET_CHARS
 
 
 def _build_graph() -> nx.MultiDiGraph:

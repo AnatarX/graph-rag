@@ -4,14 +4,17 @@ import streamlit.components.v1 as components
 import streamlit as st
 
 from graph_rag.clustering import CLUSTERS_PATH, load_clusters
+from graph_rag.config import settings
 from graph_rag.embeddings import EMBEDDINGS_PATH
 from graph_rag.graph_store import GRAPH_PATH
 
-st.set_page_config(page_title="Mini GraphRAG · BBC News", page_icon="🕸️", layout="wide")
-st.title("🕸️ Mini GraphRAG — BBC News")
+# Название датасета — из настроек, а не захардкожено: UI обслуживает тот корпус, что
+# реально собран в artifacts/<dataset>/ (см. config.Settings.dataset_artifacts_dir).
+st.set_page_config(page_title=f"Mini GraphRAG · {settings.dataset}", page_icon="🕸️", layout="wide")
+st.title(f"🕸️ Mini GraphRAG — {settings.dataset}")
 st.caption(
-    "Гибридный поиск (векторный + граф знаний) по 100 статьям BBC News — "
-    "спроси что-нибудь про политику, теннис, футбол, финансы или IT-безопасность."
+    f"Гибридный поиск (векторный + граф знаний) по корпусу «{settings.dataset}» "
+    "— спроси что-нибудь про сущности и темы из документов."
 )
 
 if not (EMBEDDINGS_PATH.exists() and GRAPH_PATH.exists()):
@@ -47,19 +50,37 @@ with st.sidebar:
 # st.chat_input вызывается на верхнем уровне (не внутри вкладки) — иначе Streamlit не
 # прижимает поле ввода ко дну страницы, и оно визуально "уезжает" выше уже отрисованной
 # истории чата.
-question = st.chat_input("Задай вопрос по датасету BBC News...")
+question = st.chat_input(f"Задай вопрос по датасету {settings.dataset}...")
 
 chat_tab, graph_tab = st.tabs(["💬 Чат", "🕸️ Граф"])
 
-# Первые два примера содержат имена собственные из датасета — на них срабатывает
-# графовая часть retrieval (см. README про ограничение: сущности в графе английские,
-# т.к. датасет английский, поэтому чисто русский вопрос граф не активирует). Третий —
-# намеренно без имён, чтобы было видно и чисто векторный режим.
-EXAMPLE_QUESTIONS = [
-    "Расскажи про Tony Blair",
-    "Что связывает Tony Blair и Michael Howard?",
-    "Какие проблемы с безопасностью ПК обсуждаются?",
-]
+
+@st.cache_data(show_spinner=False)
+def _example_questions() -> list[str]:
+    """Примеры вопросов строятся ПО СОБРАННОМУ КОРПУСУ, а не захардкожены под BBC.
+
+    Первые два содержат имена собственные — самые связанные сущности графа, на них
+    гарантированно срабатывает графовая часть retrieval (см. README про ограничение:
+    сущности в графе английские, т.к. датасеты английские, поэтому чисто русский вопрос
+    граф не активирует). Третий — по названию самого крупного кластера, намеренно без
+    имён, чтобы было видно и чисто векторный режим."""
+    G = _cached_graph()
+    top_names = [
+        G.nodes[key]["name"]
+        for key, _ in sorted(G.degree(), key=lambda item: -item[1])[:2]
+        if G.nodes[key].get("name")
+    ]
+    questions = []
+    if top_names:
+        questions.append(f"Расскажи про {top_names[0]}")
+    if len(top_names) > 1:
+        questions.append(f"Что связывает {top_names[0]} и {top_names[1]}?")
+    if CLUSTERS_PATH.exists():
+        clusters = load_clusters()["clusters"].values()
+        largest = max(clusters, key=lambda c: c["size"], default=None)
+        if largest:
+            questions.append(f"Что в документах говорится про {largest['label']}?")
+    return questions or ["О чём этот корпус документов?"]
 
 
 def _render_sources(sources: dict) -> None:
@@ -99,8 +120,9 @@ with chat_tab:
         if not st.session_state.messages
         else "Примеры вопросов:"
     )
-    cols = st.columns(len(EXAMPLE_QUESTIONS))
-    for col, example in zip(cols, EXAMPLE_QUESTIONS):
+    examples = _example_questions()
+    cols = st.columns(len(examples))
+    for col, example in zip(cols, examples):
         if col.button(example, use_container_width=True):
             question = example
 
@@ -173,7 +195,10 @@ def _render_graph_tab() -> None:
         keys = {k for k, _ in sorted(degree.items(), key=lambda item: -item[1])[:n]}
     elif mode == "Окрестность сущности":
         col1, col2 = st.columns([3, 1])
-        query = col1.text_input("Сущность (например, Tony Blair)")
+        # Подсказка — реальная сущность из текущего графа, а не имя из BBC-корпуса.
+        hint = max(G.degree(), key=lambda item: item[1], default=(None, 0))[0]
+        hint_name = G.nodes[hint]["name"] if hint is not None else "имя из графа"
+        query = col1.text_input(f"Сущность (например, {hint_name})")
         hops = col2.slider("Хопов", 1, 2, 1)
         if query:
             keys = neighborhood_keys(G, query, hops)

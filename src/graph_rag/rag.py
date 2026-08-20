@@ -21,10 +21,8 @@ from graph_rag.clustering import l2_normalize
 from graph_rag.config import settings
 from graph_rag.embeddings import EMBEDDINGS_PATH, load_embeddings
 from graph_rag.graph_store import GRAPH_PATH, k_hop_neighbors, load_graph
-from graph_rag.ingest import load_saved_corpus
+from graph_rag.ingest import DOCS_PATH, load_corpus_profile, load_saved_corpus
 from graph_rag.llm_client import chat_complete, embed_texts
-
-DOCS_PATH = settings.artifacts_dir / "docs.parquet"
 
 # In-process кэш по (путь файла, mtime): retrieve() вызывается на каждый вопрос в чате,
 # и без этого docs.parquet/embeddings.npy/graph.json (1157 узлов) перечитывались бы с
@@ -51,12 +49,21 @@ TOP_K_DOCS = 5
 GRAPH_HOPS = 1
 ENTITY_MATCH_SCORE_CUTOFF = 80
 MAX_ENTITY_MATCHES = 5
-# Медиана длины статьи в корпусе — 2137 символов (максимум 7121), так что этот лимит
-# покрывает медианную статью почти целиком, а не только её первые ~19%, как было при 400.
-# Полный чанкинг (раздельный эмбеддинг фрагментов документа) — отдельная архитектурная
-# задача; здесь прагматичный фикс на уровне окна контекста. Остаток режется по границе
-# предложения, а не посреди слова — см. `_truncate_at_sentence`.
+# Сниппет должен покрывать типичный документ КОРПУСА целиком, а не его первые ~19%, как
+# было при 400: полный чанкинг (раздельный эмбеддинг фрагментов документа) — отдельная
+# архитектурная задача, здесь прагматичный фикс на уровне окна контекста. Остаток режется
+# по границе предложения, а не посреди слова — см. `_truncate_at_sentence`.
+#
+# "Типичный документ" — величина датасето-зависимая (у BBC медиана 2137 символов, у
+# 20 Newsgroups после чистки — заметно меньше), поэтому берём медиану из профиля корпуса
+# (`ingest.compute_corpus_profile`), а константу ниже оставляем фолбэком на случай, когда
+# профиля на диске нет (старые артефакты, тесты).
 SNIPPET_CHARS = 2200
+# Клэмп на случай экстремальных корпусов: слишком короткий сниппет обрезает документ до
+# бессмысленного огрызка, слишком длинный — раздувает промпт (TOP_K_DOCS документов в
+# каждом запросе) и вытесняет из контекста факты графа.
+MIN_SNIPPET_CHARS = 800
+MAX_SNIPPET_CHARS = 4000
 # top_k_docs — потолок, а не гарантия: документы со score ниже порога отсекаются даже
 # если top_k ещё не набран (см. `retrieve`). Порог подобран по распределению попарных
 # косинусных сходств документов корпуса (l2-нормализованные эмбеддинги, artifacts/embeddings.npy):
@@ -73,7 +80,7 @@ MAX_GRAPH_FACTS_IN_PROMPT = 15
 HISTORY_USER_TURNS_FOR_RETRIEVAL = 2
 MAX_HISTORY_MESSAGES = 12  # последние 6 пар вопрос/ответ — дальше историю обрезаем
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT_TEMPLATE = """\
 Ты отвечаешь на вопросы, используя ТОЛЬКО предоставленный контекст (фрагменты документов
 и факты из графа знаний). Если в контексте недостаточно информации — прямо скажи об этом,
 не выдумывай. Не копируй фрагменты контекста дословно — перескажи своими словами.
@@ -84,8 +91,23 @@ _SYSTEM_PROMPT = """\
 
 После утверждений, взятых из источника, указывай его реальный идентификатор в квадратных
 скобках, подставляя вместо doc_id настоящее значение из контекста — например, если в
-контексте есть фрагмент "[bbc-0035] ...", пиши в ответе [bbc-0035], а не буквально
-"[doc_id]"."""
+контексте есть фрагмент "[{example_doc_id}] ...", пиши в ответе [{example_doc_id}], а не
+буквально "[doc_id]"."""
+# Пример doc_id в промпте — из текущего датасета (doc_id префиксуются его именем, см.
+# ingest.load_corpus): с захардкоженным "bbc-0035" модель на другом датасете охотно
+# цитирует несуществующие [bbc-...] источники, копируя формат прямо из инструкции.
+_SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.format(example_doc_id=f"{settings.dataset}-0035")
+
+
+def snippet_chars(profile: dict | None = None) -> int:
+    """Длина сниппета для текущего корпуса: медиана длины документа из профиля корпуса,
+    зажатая в [MIN_SNIPPET_CHARS, MAX_SNIPPET_CHARS], либо фолбэк `SNIPPET_CHARS`, если
+    профиля нет. Профиль передаётся параметром только в тестах — в бою читается с диска."""
+    profile = load_corpus_profile() if profile is None else profile
+    median = profile.get("median_doc_chars")
+    if not median:
+        return SNIPPET_CHARS
+    return int(min(max(int(median), MIN_SNIPPET_CHARS), MAX_SNIPPET_CHARS))
 
 
 @dataclass
@@ -183,12 +205,13 @@ def retrieve(query: str, top_k_docs: int = TOP_K_DOCS, hops: int = GRAPH_HOPS) -
     ranked_idx = np.argsort(-sims)
     top_idx = [i for i in ranked_idx if sims[i] >= MIN_DOC_SCORE][:top_k_docs]
 
+    limit = snippet_chars()
     vector_hits = [
         VectorHit(
             doc_id=docs.iloc[i]["doc_id"],
             score=float(sims[i]),
             title=docs.iloc[i]["title"],
-            snippet=_truncate_at_sentence(docs.iloc[i]["text"], SNIPPET_CHARS),
+            snippet=_truncate_at_sentence(docs.iloc[i]["text"], limit),
         )
         for i in top_idx
     ]

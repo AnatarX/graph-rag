@@ -31,8 +31,8 @@ from graph_rag.embeddings import load_embeddings
 from graph_rag.ingest import load_saved_corpus
 from graph_rag.llm_client import chat_complete
 
-CLUSTERS_PATH = settings.artifacts_dir / "clusters.json"
-DOC_CLUSTERS_PATH = settings.artifacts_dir / "doc_clusters.parquet"
+CLUSTERS_PATH = settings.dataset_artifacts_dir / "clusters.json"
+DOC_CLUSTERS_PATH = settings.dataset_artifacts_dir / "doc_clusters.parquet"
 
 N_REPRESENTATIVE_DOCS = 5
 # 30 токенов недостаточно даже с запасом — на "рассуждающей" модели (chain-of-thought
@@ -82,7 +82,7 @@ def label_cluster(representative_titles: list[str]) -> str:
         {
             "role": "system",
             "content": (
-                "Ты помогаешь называть тематические кластеры новостных статей. "
+                "Ты помогаешь называть тематические кластеры текстовых документов. "
                 "Ответь ТОЛЬКО коротким названием темы на английском (2-4 слова), "
                 "без кавычек и пояснений."
             ),
@@ -126,7 +126,7 @@ def build_clusters(force: bool = False) -> dict:
             "representative_doc_ids": docs.iloc[rep_idx]["doc_id"].tolist(),
         }
 
-    settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    settings.dataset_artifacts_dir.mkdir(parents=True, exist_ok=True)
     CLUSTERS_PATH.write_text(
         json.dumps(
             {"k": best_k, "silhouette_scores": scores, "clusters": clusters},

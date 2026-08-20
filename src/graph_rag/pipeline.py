@@ -16,28 +16,42 @@ from datetime import datetime, timezone
 
 import typer
 
-from graph_rag.clustering import CLUSTERS_PATH, build_clusters
+from graph_rag.clustering import CLUSTERS_PATH, DOC_CLUSTERS_PATH, build_clusters
 from graph_rag.config import settings
 from graph_rag.embeddings import EMBEDDINGS_PATH, build_embeddings
 from graph_rag.graph_extraction import EXTRACTIONS_PATH, build_extractions
 from graph_rag.graph_store import GRAPH_PATH, attach_clusters, build_graph, load_graph, save_graph
-from graph_rag.ingest import load_corpus, load_saved_corpus, save_corpus
+from graph_rag.ingest import (
+    CORPUS_PROFILE_PATH,
+    DOCS_PATH,
+    ensure_corpus_profile,
+    load_corpus,
+    load_saved_corpus,
+    save_corpus,
+)
 
 app = typer.Typer(add_completion=False)
 
-DOCS_PATH = settings.artifacts_dir / "docs.parquet"
-DOC_CLUSTERS_PATH = settings.artifacts_dir / "doc_clusters.parquet"
+METADATA_PATH = settings.dataset_artifacts_dir / "run_metadata.json"
 
 
 @app.command()
 def build(force: bool = typer.Option(False, "--force", help="Пересчитать все шаги заново")) -> None:
+    typer.echo(f"датасет: {settings.dataset} -> {settings.dataset_artifacts_dir}")
     if force or not DOCS_PATH.exists():
         typer.echo("[1/5] ingest: сэмплирую датасет...")
         save_corpus(load_corpus())
     else:
         typer.echo("[1/5] ingest: уже есть, пропускаю")
     docs = load_saved_corpus()
-    typer.echo(f"      {len(docs)} документов")
+    # Профиль корпуса нужен шагам ниже (фильтр по капитализации в graph_extraction,
+    # длина сниппета в rag) — досчитываем его и для корпуса, собранного до появления
+    # профиля, иначе без --force он бы не появился никогда.
+    profile = ensure_corpus_profile(docs)
+    typer.echo(
+        f"      {len(docs)} документов; регистр информативен: {profile['has_meaningful_case']}, "
+        f"медиана длины документа: {profile['median_doc_chars']} симв."
+    )
 
     if force or not EMBEDDINGS_PATH.exists():
         typer.echo("[2/5] embeddings: считаю через LLM-провайдера...")
@@ -81,29 +95,32 @@ def build(force: bool = typer.Option(False, "--force", help="Пересчита�
     # никогда бы не появился без --force.
     run_metadata = {
         "built_at": datetime.now(timezone.utc).isoformat(),
+        "dataset": settings.dataset,
         "chat_model": settings.llm_chat_model,
         "embed_model": settings.llm_embed_model,
         "n_docs": len(docs),
         "graph_nodes": G.number_of_nodes(),
         "graph_edges": G.number_of_edges(),
+        "corpus_profile": profile,
     }
-    metadata_path = settings.artifacts_dir / "run_metadata.json"
-    metadata_path.write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    typer.echo(f"      метаданные прогона -> {metadata_path}")
+    METADATA_PATH.write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    typer.echo(f"      метаданные прогона -> {METADATA_PATH}")
 
     typer.echo("Готово. Дальше: `uv run streamlit run app/streamlit_app.py`")
 
 
 @app.command()
 def status() -> None:
+    typer.echo(f"датасет: {settings.dataset} -> {settings.dataset_artifacts_dir}")
     artifacts = {
         "docs.parquet": DOCS_PATH,
+        "corpus_profile.json": CORPUS_PROFILE_PATH,
         "embeddings.npy": EMBEDDINGS_PATH,
         "clusters.json": CLUSTERS_PATH,
         "doc_clusters.parquet": DOC_CLUSTERS_PATH,
         "extractions.json": EXTRACTIONS_PATH,
         "graph.json": GRAPH_PATH,
-        "run_metadata.json": settings.artifacts_dir / "run_metadata.json",
+        "run_metadata.json": METADATA_PATH,
     }
     for name, path in artifacts.items():
         mark = "✓" if path.exists() else "·"
@@ -115,7 +132,7 @@ def status() -> None:
     if metadata_path.exists():
         meta = json.loads(metadata_path.read_text(encoding="utf-8"))
         typer.echo(
-            f"  последний прогон: {meta['built_at']}\n"
+            f"  последний прогон: {meta['built_at']} (датасет: {meta.get('dataset', '?')})\n"
             f"  модели: chat={meta['chat_model']}, embed={meta['embed_model']}\n"
             f"  {meta['n_docs']} документов -> граф {meta['graph_nodes']} узлов / "
             f"{meta['graph_edges']} рёбер"

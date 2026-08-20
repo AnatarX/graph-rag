@@ -20,13 +20,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from graph_rag.config import settings
-from graph_rag.ingest import load_saved_corpus
+from graph_rag.ingest import load_corpus_profile, load_saved_corpus
 from graph_rag.llm_client import LLMResponseError, chat_complete
 
-EXTRACTIONS_PATH = settings.artifacts_dir / "extractions.json"
+EXTRACTIONS_PATH = settings.dataset_artifacts_dir / "extractions.json"
 
 _SYSTEM_PROMPT = """\
-Ты извлекаешь сущности и связи между ними из новостного текста для построения графа знаний.
+Ты извлекаешь сущности и связи между ними из текста документа для построения графа знаний.
+Текст может быть чем угодно — новостной статьёй, сообщением с форума, письмом.
 
 Сущности: люди, организации, места, продукты — только те, что явно упомянуты в тексте.
 Имя сущности — короткое настоящее имя (обычно 1-6 слов), как "Tony Blair" или
@@ -70,20 +71,25 @@ _MAX_ENTITY_NAME_WORDS = 6
 _CURRENCY_SIGNS = frozenset("£$€¥₽")
 
 
-def is_valid_entity_name(name: str) -> bool:
+def is_valid_entity_name(name: str, *, require_capitalization: bool = False) -> bool:
     """True, если `name` похоже на короткое имя сущности, а не на фразу/предложение
     (см. `_MAX_ENTITY_NAME_WORDS`). Используется и здесь при извлечении (фильтрует
     будущие LLM-вызовы), и в graph_store.build_graph (чистит уже закэшированные
     extractions.json задним числом, без повторного вызова LLM).
 
-    Проверка "есть заглавная буква" здесь сознательно НЕ используется как сигнал
-    именованности: в этом конкретном датасете (BBC News CSV) текст статей приходит
-    уже полностью в нижнем регистре (проверено на docs.parquet — ни одной заглавной
-    буквы во всём корпусе), поэтому такой фильтр отсекал бы заодно легитимные сущности
-    ("microsoft", "yukos") наравне с мусором ("law change") — на реальных данных это
-    роняло граф с ~880 узлов до ~35. Различие между именем и описательной фразой в
-    таком тексте физически неизвлекаемо из одной лишь капитализации — разграничивать
-    их приходится на уровне промпта (см. _SYSTEM_PROMPT), а не постфактум-фильтром.
+    `require_capitalization` — проверка "в имени есть хоть одна заглавная буква" как
+    сигнал именованности: "Microsoft" остаётся, "law change" отсекается. По умолчанию
+    ВЫКЛЮЧЕНА, потому что её применимость зависит от корпуса, а не от датасета вообще:
+    в BBC News CSV текст статей приходит целиком в нижнем регистре (проверено на
+    docs.parquet — ни одной заглавной буквы во всём корпусе), и там такой фильтр резал
+    бы легитимные сущности ("microsoft", "yukos") наравне с мусором — на реальных
+    данных это роняло граф с ~880 узлов до ~35. В корпусе с нормальным регистром
+    (20 Newsgroups) это, наоборот, самый дешёвый и сильный фильтр описательных оборотов.
+    Поэтому решение принимает не константа, а профиль корпуса, посчитанный на шаге
+    ingest (`ingest.compute_corpus_profile` -> `has_meaningful_case`); вызывающий код
+    прокидывает флаг сюда, см. `_require_capitalization` ниже. Когда регистр
+    неинформативен, различать имя и описательную фразу приходится на уровне промпта
+    (см. _SYSTEM_PROMPT), а не постфактум-фильтром.
 
     А вот величины отсекаем здесь же — это не сущности, а атрибуты фактов, и в графе они
     были откровенным мусором ("25%", "£1bn", "2005", "£500m initiative" — последнее ревьюер
@@ -100,7 +106,20 @@ def is_valid_entity_name(name: str) -> bool:
         return False
     if name[0] in _CURRENCY_SIGNS:
         return False
+    if require_capitalization and not any(c.isupper() for c in name):
+        return False
     return len(name.split()) <= _MAX_ENTITY_NAME_WORDS
+
+
+def require_capitalization_for_corpus(explicit: bool | None = None) -> bool:
+    """Использовать ли капитализацию как сигнал именованности: явное значение, если его
+    задал вызывающий код (в первую очередь тесты), иначе — из профиля корпуса.
+
+    Профиль читается с диска, поэтому значение резолвится один раз на батч
+    (`build_extractions` / `graph_store.build_graph`), а не на каждую сущность."""
+    if explicit is not None:
+        return explicit
+    return bool(load_corpus_profile().get("has_meaningful_case", False))
 
 
 def _parse_json(raw: str) -> dict:
@@ -120,7 +139,15 @@ _EXTRACTION_MAX_TOKENS = 1200
 _EXTRACTION_RETRY_MAX_TOKENS = 2400
 
 
-def extract_from_text(doc_id: str, text: str, use_cache: bool = True) -> DocExtraction:
+def extract_from_text(
+    doc_id: str,
+    text: str,
+    use_cache: bool = True,
+    require_capitalization: bool | None = None,
+) -> DocExtraction:
+    """`require_capitalization=None` — взять решение из профиля корпуса (см.
+    `require_capitalization_for_corpus`); явное True/False переопределяет его."""
+    require_capitalization = require_capitalization_for_corpus(require_capitalization)
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": text},
@@ -159,7 +186,9 @@ def extract_from_text(doc_id: str, text: str, use_cache: bool = True) -> DocExtr
     entities = [
         e
         for e in data.get("entities", [])
-        if isinstance(e, dict) and e.get("name") and is_valid_entity_name(e["name"])
+        if isinstance(e, dict)
+        and e.get("name")
+        and is_valid_entity_name(e["name"], require_capitalization=require_capitalization)
     ]
     relations = [
         r
@@ -168,8 +197,8 @@ def extract_from_text(doc_id: str, text: str, use_cache: bool = True) -> DocExtr
         and r.get("subject")
         and r.get("object")
         and r.get("predicate")
-        and is_valid_entity_name(r["subject"])
-        and is_valid_entity_name(r["object"])
+        and is_valid_entity_name(r["subject"], require_capitalization=require_capitalization)
+        and is_valid_entity_name(r["object"], require_capitalization=require_capitalization)
     ]
     return DocExtraction(doc_id=doc_id, entities=entities, relations=relations)
 
@@ -190,10 +219,17 @@ def build_extractions(force: bool = False) -> list[dict]:
     # дискового llm_cache по тому же промпту (см. llm_client._cache_key) — иначе
     # --force чистит только extractions.json, но не сам источник "залипания".
     use_cache = not force
+    # Профиль корпуса читаем с диска один раз на весь батч, а не в каждом воркере.
+    require_capitalization = require_capitalization_for_corpus()
 
     def _extract(row: tuple) -> DocExtraction:
         _, r = row
-        return extract_from_text(r["doc_id"], r["text"], use_cache=use_cache)
+        return extract_from_text(
+            r["doc_id"],
+            r["text"],
+            use_cache=use_cache,
+            require_capitalization=require_capitalization,
+        )
 
     results = []
     # executor.map сохраняет порядок аргументов (не порядок завершения), поэтому
@@ -211,7 +247,7 @@ def build_extractions(force: bool = False) -> list[dict]:
                 }
             )
 
-    settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    settings.dataset_artifacts_dir.mkdir(parents=True, exist_ok=True)
     EXTRACTIONS_PATH.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     return results
 

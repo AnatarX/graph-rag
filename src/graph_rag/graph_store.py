@@ -43,9 +43,9 @@ from rapidfuzz import fuzz, process
 
 from graph_rag.config import settings
 from graph_rag.entity_resolution import EntityIndex, add_to_index, create_index, resolve_entity_semantically
-from graph_rag.graph_extraction import is_valid_entity_name
+from graph_rag.graph_extraction import is_valid_entity_name, require_capitalization_for_corpus
 
-GRAPH_PATH = settings.artifacts_dir / "graph.json"
+GRAPH_PATH = settings.dataset_artifacts_dir / "graph.json"
 
 
 def _normalize(name: str) -> str:
@@ -105,7 +105,11 @@ def _resolve_key_with_fallback(
     return semantic_key if semantic_key is not None else key
 
 
-def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> nx.MultiDiGraph:
+def build_graph(
+    extractions: list[dict],
+    resolve_semantically: bool = True,
+    require_capitalization: bool | None = None,
+) -> nx.MultiDiGraph:
     """Собирает граф из LLM-экстракций. Записи, где subject/object/entity — не короткое
     имя сущности, а целая фраза/предложение (LLM это иногда делает, вопреки промпту —
     см. `graph_extraction.is_valid_entity_name`), отбрасываются здесь же: это дешёвая
@@ -122,7 +126,13 @@ def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> n
     `pipeline build --force`, отдельный кэш индекса был бы лишней сложностью. При
     `resolve_semantically=False` индекс вообще не создаётся (в частности, не делает ни
     одного embedding-вызова) — используется офлайн-тестами токенной эвристики и любым
-    вызывающим кодом, которому семантический шаг не нужен."""
+    вызывающим кодом, которому семантический шаг не нужен.
+
+    `require_capitalization=None` (по умолчанию) — фильтр по капитализации имён берётся
+    из профиля корпуса (см. `graph_extraction.is_valid_entity_name`); если профиля на
+    диске нет, поведение прежнее, без этого фильтра. Явное True/False переопределяет
+    профиль — это нужно тестам, чтобы не зависеть от наличия артефактов."""
+    require_capitalization = require_capitalization_for_corpus(require_capitalization)
     G = nx.MultiDiGraph()
     entity_index = create_index() if resolve_semantically else None
     name_counts: dict[str, Counter] = {}
@@ -145,7 +155,7 @@ def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> n
             print(f"  [{doc_num}/{total_docs}] резолвлю сущности: {doc['doc_id']}", flush=True)
         doc_id = doc["doc_id"]
         for entity in doc["entities"]:
-            if not is_valid_entity_name(entity["name"]):
+            if not is_valid_entity_name(entity["name"], require_capitalization=require_capitalization):
                 continue
             etype = entity.get("type", "other")
             key = _resolve_key_with_fallback(G, entity_index, entity["name"], etype, resolve_semantically)
@@ -169,7 +179,9 @@ def build_graph(extractions: list[dict], resolve_semantically: bool = True) -> n
                 type_counts.setdefault(key, Counter())[etype] += 1
 
         for relation in doc["relations"]:
-            if not is_valid_entity_name(relation["subject"]) or not is_valid_entity_name(relation["object"]):
+            if not is_valid_entity_name(
+                relation["subject"], require_capitalization=require_capitalization
+            ) or not is_valid_entity_name(relation["object"], require_capitalization=require_capitalization):
                 continue
             skey = _resolve_key_with_fallback(G, entity_index, relation["subject"], "other", resolve_semantically)
             okey = _resolve_key_with_fallback(G, entity_index, relation["object"], "other", resolve_semantically)
@@ -223,7 +235,7 @@ def save_graph(G: nx.MultiDiGraph, path: Path = GRAPH_PATH) -> None:
         {"source": u, "target": v, "predicate": data["predicate"], "doc_ids": sorted(data["doc_ids"])}
         for u, v, data in G.edges(data=True)
     ]
-    settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    settings.dataset_artifacts_dir.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"nodes": nodes, "edges": edges}, ensure_ascii=False, indent=2), encoding="utf-8")
 
 

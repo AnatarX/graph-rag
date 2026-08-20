@@ -26,6 +26,28 @@ def test_empty_name_is_rejected():
     assert not is_valid_entity_name("   ")
 
 
+def test_require_capitalization_rejects_lowercase_descriptive_phrase():
+    # Корпус с нормальным регистром (например, 20 Newsgroups): отсутствие заглавной —
+    # надёжный признак того, что это описательный оборот, а не имя собственное.
+    assert is_valid_entity_name("law change", require_capitalization=True) is False
+    assert is_valid_entity_name("Microsoft", require_capitalization=True) is True
+    assert is_valid_entity_name("Tony Blair", require_capitalization=True) is True
+
+
+def test_without_require_capitalization_lowercase_names_stay_valid():
+    # Поведение по умолчанию (корпус в нижнем регистре, как BBC News CSV) — прежнее:
+    # регистр вообще не рассматривается как сигнал.
+    assert is_valid_entity_name("law change") is True
+    assert is_valid_entity_name("microsoft") is True
+    assert is_valid_entity_name("microsoft", require_capitalization=False) is True
+
+
+def test_require_capitalization_does_not_override_other_filters():
+    # Заглавная буква не спасает мусор, отсекаемый остальными проверками.
+    assert is_valid_entity_name("£500m Initiative", require_capitalization=True) is False
+    assert is_valid_entity_name("At least we are still talking.", require_capitalization=True) is False
+
+
 def test_parse_json_valid_json_parses_as_is():
     raw = '{"entities": [{"name": "Tony Blair", "type": "person"}], "relations": []}'
     assert _parse_json(raw) == {

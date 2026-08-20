@@ -15,7 +15,7 @@ from graph_rag.config import settings
 from graph_rag.ingest import load_saved_corpus
 from graph_rag.llm_client import embed_texts
 
-EMBEDDINGS_PATH = settings.artifacts_dir / "embeddings.npy"
+EMBEDDINGS_PATH = settings.dataset_artifacts_dir / "embeddings.npy"
 
 
 def build_embeddings(force: bool = False) -> np.ndarray:
@@ -25,7 +25,7 @@ def build_embeddings(force: bool = False) -> np.ndarray:
     docs = load_saved_corpus()
     vectors = embed_texts(docs["text"].tolist())
 
-    settings.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    settings.dataset_artifacts_dir.mkdir(parents=True, exist_ok=True)
     np.save(EMBEDDINGS_PATH, vectors)
     return vectors
 
