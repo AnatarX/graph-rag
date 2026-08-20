@@ -17,6 +17,7 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -147,17 +148,34 @@ def _cache_path(key: str) -> Path:
 
 
 def _cache_get(key: str) -> dict | None:
+    """Читает запись кэша по ключу. Битый/пустой файл (например, процесс убило посреди
+    записи — ноутбук ушёл в сон, kill -9, отключили питание) трактуется как отсутствие
+    записи, а не как ошибка: на реальных данных именно так и падал `pipeline build`
+    (`JSONDecodeError: Expecting value` на пустом файле кэша) после прерывания долгого
+    прогона. `_cache_set` ниже пишет атомарно, так что новых таких файлов появляться не
+    должно, но старые, уже лежащие на диске, эта защита тоже переживает."""
     path = _cache_path(key)
-    if path.exists():
+    if not path.exists():
+        return None
+    try:
         return json.loads(path.read_text(encoding="utf-8"))
-    return None
+    except json.JSONDecodeError:
+        return None
 
 
 def _cache_set(key: str, payload: dict, result: object) -> None:
-    _cache_path(key).write_text(
+    """Пишет запись кэша атомарно: во временный файл в той же директории (та же
+    файловая система — гарантия атомарности `os.replace`), затем переименование поверх
+    целевого пути. Если процесс убьют посреди записи — останется незавершённый temp-файл,
+    а не наполовину записанный (или вовсе пустой) `*.json`, который иначе бы навсегда
+    ломал `_cache_get` при следующем запуске (см. её докстринг)."""
+    path = _cache_path(key)
+    tmp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(
         json.dumps({"payload": payload, "result": result}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    tmp_path.replace(path)
 
 
 def clear_cache() -> int:
